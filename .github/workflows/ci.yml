@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Must match the uv tag pinned in the Dockerfile, and be new enough to read uv.lock
+  # (revision 3). Bump both together.
+  UV_VERSION: "0.11.28"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      # --frozen fails if uv.lock is stale against pyproject.toml.
+      - run: uv sync --frozen
+      - run: uv run ruff check --output-format=github .
+      - run: uv run ruff format --check .
+      - run: uv run mypy app/
+      # The committed gate. Local hooks check the same things earlier but are bypassable.
+      - run: uv run python scripts/check_invariants.py
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: shortener
+          POSTGRES_PASSWORD: shortener
+          POSTGRES_DB: shortener_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U shortener"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+    # No ClickHouse or Kafka: nothing under tests/ connects to either, and `services:`
+    # cannot mount volumes, so one started here would differ from the compose one on
+    # deduplicate_blocks_in_dependent_materialized_views. The `build` job covers them.
+    # Analytics integration tests bring their own services; do not un-mark tests to get
+    # a green run.
+    #
+    # TEST_-prefixed because conftest.py pins the connection env — a bare DATABASE_URL
+    # here would be silently overwritten and this block would be decoration.
+    env:
+      TEST_DATABASE_URL: postgresql+asyncpg://shortener:shortener@localhost:5432/shortener_test
+      TEST_REDIS_URL: redis://localhost:6379/0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - run: uv sync --frozen
+
+      - name: Unit tests
+        run: uv run pytest -m "not integration" --cov --cov-report=xml -q
+
+      # `services:` rather than Testcontainers: the containers are healthy before the
+      # step starts, so there is no in-job Docker startup cost.
+      - name: Integration tests
+        run: uv run pytest -m integration -q
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage.xml
+
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      # Loaded as url-shortener:ci, which compose names as the api's `image:`, so `up`
+      # reuses this build.
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          load: true
+          tags: url-shortener:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Catches what unit tests cannot see: a broken compose file, a bad ClickHouse
+      # config, a topic that never gets created, a service that cannot reach another.
+      - name: Boot the stack
+        run: docker compose up -d --wait --wait-timeout 180
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --retry 12 --retry-delay 5 \
+               --retry-all-errors http://localhost:8000/healthz
+          echo
+          curl --fail --silent --show-error http://localhost:8000/readyz
+          echo
+          # Absolute path: /opt/kafka/bin is not on PATH in apache/kafka:3.9.1, and the
+          # resulting "executable file not found" reads like a missing topic.
+          docker compose exec -T kafka \
+            /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+            --describe --topic clicks
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs --no-color --tail 200
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

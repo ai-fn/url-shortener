@@ -1,0 +1,150 @@
+# Every service carries a memory limit: this stack is ~6-8 GB unbounded.
+
+name: url-shortener
+
+x-healthcheck-defaults: &healthcheck-defaults
+  interval: 10s
+  timeout: 5s
+  retries: 10
+  start_period: 20s
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: shortener
+      POSTGRES_PASSWORD: shortener
+      POSTGRES_DB: shortener
+    ports: ["127.0.0.1:5432:5432"]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/initdb:/docker-entrypoint-initdb.d:ro
+    mem_limit: 512m
+    healthcheck:
+      # -h 127.0.0.1 is load-bearing: initdb's temporary server listens on the unix
+      # socket only, so a socket-based pg_isready reports healthy while
+      # scripts/initdb/ is still running and shortener_test does not exist yet.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U shortener -d shortener"]
+      <<: *healthcheck-defaults
+
+  redis:
+    image: redis:7-alpine
+    # allkeys-lru is load-bearing, not tuning: under `noeviction` an attacker
+    # enumerating short codes fills the instance with negative-cache sentinels and
+    # every subsequent write starts failing.
+    command: >
+      redis-server
+      --maxmemory 192mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+      --appendonly no
+    # Loopback-only: no password here, Kafka is PLAINTEXT, Postgres accepts
+    # shortener:shortener.
+    ports: ["127.0.0.1:6379:6379"]
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      <<: *healthcheck-defaults
+
+  kafka:
+    image: apache/kafka:3.9.1
+    environment:
+      # KRaft single-node: no ZooKeeper.
+      KAFKA_NODE_ID: "0"
+      KAFKA_PROCESS_ROLES: "controller,broker"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "0@kafka:9093"
+      KAFKA_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:19092"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092,EXTERNAL://localhost:19092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      # 7 days, so rollups can be rebuilt by replaying the topic.
+      KAFKA_LOG_RETENTION_HOURS: "168"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms512m"
+    ports: ["127.0.0.1:19092:19092"]
+    volumes: ["kafka-data:/var/lib/kafka/data"]
+    mem_limit: 1g
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1
+      <<: *healthcheck-defaults
+
+  kafka-init:
+    image: apache/kafka:3.9.1
+    depends_on:
+      kafka: {condition: service_healthy}
+    restart: "no"
+    mem_limit: 256m
+    command: >
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092
+      --create --if-not-exists
+      --topic clicks
+      --partitions 6
+      --replication-factor 1
+      --config retention.ms=604800000
+      --config cleanup.policy=delete
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.12-alpine
+    environment:
+      CLICKHOUSE_DB: analytics
+      # A named user with a password: with neither set the entrypoint disables network
+      # access for `default` and the api cannot connect.
+      CLICKHOUSE_USER: analytics
+      CLICKHOUSE_PASSWORD: dev-only-insecure-clickhouse
+    ports:
+      - "127.0.0.1:8123:8123"   # HTTP
+      - "127.0.0.1:9000:9000"   # native
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse/config.d:/etc/clickhouse-server/config.d:ro
+      # A FILE, not the directory: the entrypoint writes users.d/default-user.xml under
+      # `set -e`, so a :ro directory mount aborts startup and `up --wait` hangs.
+      - ./clickhouse/users.d/profiles.xml:/etc/clickhouse-server/users.d/profiles.xml:ro
+    ulimits:
+      nofile: {soft: 262144, hard: 262144}
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      <<: *healthcheck-defaults
+
+  api:
+    build:
+      context: .
+      target: runtime
+    # Named so CI's prebuilt tag is reused instead of rebuilding under compose's own.
+    image: url-shortener:ci
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      kafka: {condition: service_healthy}
+      clickhouse: {condition: service_healthy}
+      # On the exit code, not just startup: a failed --create otherwise leaves the api
+      # producing into a topic that does not exist, with auto-create off.
+      kafka-init: {condition: service_completed_successfully}
+    environment:
+      ENVIRONMENT: local
+      PUBLIC_BASE_URL: http://localhost:8000
+      DATABASE_URL: postgresql+asyncpg://shortener:shortener@postgres:5432/shortener
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_USER: analytics
+      CLICKHOUSE_PASSWORD: dev-only-insecure-clickhouse
+      # Local-only. Both are validated as >=32 chars by app/config.py.
+      SECRET_KEY: dev-only-insecure-change-me-0000000000000000
+      IP_HASH_KEY: dev-only-insecure-change-me-1111111111111111
+    # Loopback like every backing store; with ENVIRONMENT: local this also serves /docs.
+    ports: ["127.0.0.1:8000:8000"]
+    mem_limit: 512m
+
+volumes:
+  postgres-data:
+  kafka-data:
+  clickhouse-data:

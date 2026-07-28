@@ -1,0 +1,19 @@
+<clickhouse>
+    <!--
+      Profiles must live in the USERS config, not config.d/: ClickHouse reads
+      <profiles> from the file named by <users_config>, so the same block in config.d
+      is silently ignored. Verify with:
+        SELECT name, value FROM system.settings
+        WHERE name = 'deduplicate_blocks_in_dependent_materialized_views';
+    -->
+    <profiles>
+        <default>
+            <!--
+              Half of the defence against at-least-once delivery inflating rollups; the
+              other half is uniqState(event_id) in the MVs. This half only catches
+              byte-identical re-inserted blocks, so it is the backup, not the mechanism.
+            -->
+            <deduplicate_blocks_in_dependent_materialized_views>1</deduplicate_blocks_in_dependent_materialized_views>
+        </default>
+    </profiles>
+</clickhouse>

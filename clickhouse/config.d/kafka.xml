@@ -1,0 +1,21 @@
+<clickhouse>
+    <!--
+      librdkafka settings, which cannot be expressed in the Kafka table DDL.
+
+      auto_offset_reset: librdkafka defaults to `latest`, so a consumer group created
+      after messages exist silently skips them — "analytics never started working".
+      statistics_interval_ms: populates system.kafka_consumers; without it there is no
+      consumer-lag visibility.
+    -->
+    <kafka>
+        <auto_offset_reset>earliest</auto_offset_reset>
+        <session_timeout_ms>30000</session_timeout_ms>
+        <heartbeat_interval_ms>3000</heartbeat_interval_ms>
+        <max_poll_interval_ms>300000</max_poll_interval_ms>
+        <statistics_interval_ms>60000</statistics_interval_ms>
+    </kafka>
+
+    <!-- Keep ClickHouse inside its compose mem_limit (2g). -->
+    <max_server_memory_usage_to_ram_ratio>0.4</max_server_memory_usage_to_ram_ratio>
+
+</clickhouse>

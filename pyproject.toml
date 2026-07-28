@@ -1,0 +1,102 @@
+[project]
+name = "url-shortener"
+version = "0.1.0"
+description = "URL shortener with Redis-cached redirects and ClickHouse click analytics"
+readme = "README.md"
+# 3.12, not the host's 3.14: aiokafka and asyncpg wheel availability lags new releases.
+requires-python = ">=3.12,<3.13"
+
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    # Postgres — source of truth
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.30",
+    "alembic>=1.14",
+    # Redis — cache and rate limiter
+    "redis>=5.2",
+    # Kafka — click event transport
+    "aiokafka>=0.12",
+    # ClickHouse — analytics read path only
+    "clickhouse-connect>=0.8",
+    # Enrichment. maxminddb's pure-Python fallback is ~10x slower than its C
+    # extension; app/events/enrichment.py checks and logs at startup.
+    "ua-parser[regex]>=1.0",
+    "geoip2>=4.8",
+    # Auth
+    "pyjwt>=2.10",
+    "pwdlib[argon2]>=0.2",
+    # Observability
+    "structlog>=24.4",
+    "prometheus-fastapi-instrumentator>=7.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "httpx>=0.28",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+# Pinned explicitly, or ruff walks up to an ambient config and local formatting
+# drifts from CI.
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E", "W",    # pycodestyle
+    "F",         # pyflakes
+    "I",         # isort
+    "UP",        # pyupgrade
+    "B",         # bugbear
+    "C4",        # comprehensions
+    "SIM",       # simplify
+    "ASYNC",     # async correctness — blocking calls in async defs
+    "S",         # bandit security
+    "RUF",
+]
+ignore = [
+    "S104",  # binding 0.0.0.0 is correct inside a container
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+    "S101",  # assert is the point
+    "S106",  # fixture credentials are literals by design; they reach no real service
+]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["aiokafka.*", "clickhouse_connect.*", "geoip2.*", "ua_parser.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "integration: requires Postgres/Redis/Kafka/ClickHouse (deselect with -m 'not integration')",
+]
+
+[tool.coverage.run]
+# Alembic lives in `migrations/` at the repo root, outside source — no `omit` needed.
+# Pass `--cov` with no argument in CI or this is ignored.
+source = ["app", "scripts"]
