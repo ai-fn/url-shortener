@@ -45,6 +45,13 @@ CASES: list[tuple[str, str, bool]] = [
     ("app/api/redirect.py", "return RedirectResponse(url=t, status_code=301)\n", True),
     ("app/api/redirect.py", "status_code=status.HTTP_301_MOVED_PERMANENTLY\n", True),
     ("app/api/redirect.py", "status_code=HTTPStatus.MOVED_PERMANENTLY\n", True),
+    (
+        # gethostbyname() returns one address; a host with both a public and a
+        # loopback A record passes validation on whichever it happens to return.
+        "app/core/url_validation.py",
+        "def resolve(host):\n    return socket.gethostbyname(host)\n",
+        True,
+    ),
     # --- must NOT be flagged ---
     (
         "clickhouse/migrations/002_rollups.sql",
@@ -78,6 +85,14 @@ CASES: list[tuple[str, str, bool]] = [
         # catches dropping the await requirement rather than a `put\w*` widening.
         "app/api/redirect.py",
         "async def r():\n    click_q.put_nowait(event)\n",
+        False,
+    ),
+    (
+        # The prescribed fix: resolve every address, not just the first.
+        "app/core/url_validation.py",
+        "async def resolve(host):\n"
+        "    infos = await loop.getaddrinfo(host, None)\n"
+        "    return [i[4][0] for i in infos]\n",
         False,
     ),
 ]
@@ -129,13 +144,25 @@ def test_drain_task_is_out_of_hot_path_scope(tmp_path: Path) -> None:
 
     Asserted on the rules themselves: an exemption that stopped being applied would
     otherwise look identical to one that works.
+
+    Defaults to requiring the exemption on every rule scoped to all of `app/`, so a
+    *new* HOT_PATH-scoped rule that needs it but omits it is still caught. A rule
+    added for an unrelated reason (e.g. DNS resolution safety, not Kafka/queue
+    blocking) is excluded here explicitly, by name, with the reason on file — never
+    silently, or this test stops meaning anything.
     """
     from scripts.check_invariants import HOT_PATH, HOT_PATH_EXEMPT, RULES
 
     assert any("app/events/".startswith(p) for p in HOT_PATH), (
         "app/events/ must be in scope, so the exemption is what protects it"
     )
-    hot_path_rules = [r for r in RULES if r.prefixes == HOT_PATH]
+    not_about_the_drain_task = {
+        "single-address-dns-resolution": "flags unsafe DNS resolution, unrelated to "
+        "awaiting Kafka/queue calls on the request path",
+    }
+    hot_path_rules = [
+        r for r in RULES if r.prefixes == HOT_PATH and r.name not in not_about_the_drain_task
+    ]
     assert hot_path_rules, "expected rules scoped to the hot path"
     for rule in hot_path_rules:
         assert rule.exempt_prefixes == HOT_PATH_EXEMPT, (

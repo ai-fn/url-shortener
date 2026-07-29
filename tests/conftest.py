@@ -11,9 +11,19 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import AsyncIterator, Iterator
+from pathlib import Path
 
 import pytest
+import redis.asyncio as aioredis
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+from sqlalchemy.pool import NullPool
 
 # Assigned, not `setdefault`: a developer exporting DATABASE_URL to run alembic against
 # the compose stack otherwise had every integration test hit their real `shortener` db.
@@ -27,6 +37,8 @@ _DEFAULTS = {
 }
 TEST_ENV = {name: os.environ.get(f"TEST_{name}", default) for name, default in _DEFAULTS.items()}
 os.environ.update(TEST_ENV)
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 @pytest.fixture(autouse=True)
@@ -110,3 +122,76 @@ async def live_client() -> AsyncIterator[AsyncClient]:
         AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac,
     ):
         yield ac
+
+
+@pytest.fixture(scope="session")
+def _migrated_database() -> None:
+    """Applies migrations once per session, against TEST_ENV["DATABASE_URL"].
+
+    Runs here rather than as a separate CI step so local and CI schemas cannot
+    drift apart — the same reason connection details are pinned above rather than
+    read from an ambient DATABASE_URL.
+
+    Run in a worker thread: this fixture is pulled in (via `getfixturevalue`) from
+    inside async test fixtures, i.e. from inside pytest-asyncio's already-running
+    event loop. `migrations/env.py` calls `asyncio.run()`, which raises if a loop
+    is already running in the *same thread* — a separate thread has none.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from alembic import command
+    from alembic.config import Config
+
+    config = Config(str(_REPO_ROOT / "alembic.ini"))
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(command.upgrade, config, "head").result()
+
+
+@pytest.fixture
+async def db_engine(_migrated_database: None) -> AsyncIterator[AsyncEngine]:
+    # NullPool: a short-lived test engine has no business holding pooled connections
+    # open past the test.
+    engine = create_async_engine(TEST_ENV["DATABASE_URL"], poolclass=NullPool)
+    yield engine
+    await engine.dispose()
+
+
+@pytest.fixture
+async def db_session(db_engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
+    sessionmaker = async_sessionmaker(db_engine, expire_on_commit=False)
+    async with sessionmaker() as session:
+        yield session
+
+
+@pytest.fixture(autouse=True)
+async def _clean_tables(request: pytest.FixtureRequest) -> AsyncIterator[None]:
+    """Truncates mutable tables before every integration test, so one test's rows
+    never leak into the next. A no-op for unit tests, which never open a connection.
+
+    `_migrated_database` is pulled in lazily via `getfixturevalue`, not as a normal
+    parameter: a normal parameter is resolved before this function body runs at
+    all, which would run migrations against Postgres for every unit test too —
+    the exact ambient-dependency leak `_isolate_process_state` above exists to
+    prevent.
+    """
+    if request.node.get_closest_marker("integration") is None:
+        yield
+        return
+
+    request.getfixturevalue("_migrated_database")
+
+    engine = create_async_engine(TEST_ENV["DATABASE_URL"], poolclass=NullPool)
+    async with engine.begin() as conn:
+        await conn.execute(text("TRUNCATE TABLE links RESTART IDENTITY CASCADE"))
+    await engine.dispose()
+
+    # httpx's ASGITransport gives every request the same fake client address, so
+    # every integration test sharing `live_client`/`client` shares one rate-limit
+    # bucket in real Redis. Clear it, or the 30th test in a run starts seeing 429s
+    # that have nothing to do with what that test is checking.
+    redis_client = aioredis.from_url(TEST_ENV["REDIS_URL"])
+    async for key in redis_client.scan_iter(match="rl:*"):
+        await redis_client.delete(key)
+    await redis_client.aclose()
+
+    yield

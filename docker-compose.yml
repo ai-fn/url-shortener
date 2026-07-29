@@ -114,6 +114,23 @@ services:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
       <<: *healthcheck-defaults
 
+  migrate:
+    build:
+      context: .
+      target: runtime
+    image: url-shortener:ci
+    depends_on:
+      postgres: {condition: service_healthy}
+    restart: "no"
+    mem_limit: 256m
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      ENVIRONMENT: local
+      DATABASE_URL: postgresql+asyncpg://shortener:shortener@postgres:5432/shortener
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: dev-only-insecure-change-me-0000000000000000
+      IP_HASH_KEY: dev-only-insecure-change-me-1111111111111111
+
   api:
     build:
       context: .
@@ -128,6 +145,9 @@ services:
       # On the exit code, not just startup: a failed --create otherwise leaves the api
       # producing into a topic that does not exist, with auto-create off.
       kafka-init: {condition: service_completed_successfully}
+      # Same reasoning as kafka-init: N replicas starting together must not race the
+      # same `alembic upgrade`, so it runs once here rather than in api's lifespan.
+      migrate: {condition: service_completed_successfully}
     environment:
       ENVIRONMENT: local
       PUBLIC_BASE_URL: http://localhost:8000

@@ -11,7 +11,7 @@ import redis.asyncio as aioredis
 from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.api import health
+from app.api import health, links, meta, redirect
 from app.config import Settings, get_settings
 from app.core.logging import configure_logging
 
@@ -132,8 +132,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
 
     app.include_router(health.router, tags=["ops"])
+    app.include_router(meta.router, tags=["ops"])
+    app.include_router(links.router)
 
-    # Invariant 8: the catch-all `GET /{code}` registers LAST, after every other router,
-    # or it eats /docs, /metrics and /favicon.ico. It arrives in milestone 2.
+    # Invariant 8: the catch-all `GET /{code}` registers LAST, after every other
+    # router, or it eats /docs, /metrics and /favicon.ico.
+    app.include_router(redirect.router)
 
     return app

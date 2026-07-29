@@ -37,7 +37,8 @@ RUN groupadd --system --gid 1001 app \
 
 COPY --from=deps /usr/local /usr/local
 COPY --chown=app:app app/ ./app/
-# alembic.ini + migrations/ are copied here from milestone 2, when they exist.
+COPY --chown=app:app alembic.ini ./
+COPY --chown=app:app migrations/ ./migrations/
 
 USER app
 EXPOSE 8000

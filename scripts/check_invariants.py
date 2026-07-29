@@ -138,6 +138,20 @@ RULES: tuple[Rule, ...] = (
             "Use 302 with Cache-Control: no-store."
         ),
     ),
+    Rule(
+        name="single-address-dns-resolution",
+        prefixes=("app/",),
+        suffixes=(".py",),
+        pattern=re.compile(r"\bgethostbyname\w*\s*\(", re.IGNORECASE),
+        message=(
+            "gethostbyname() returns exactly one address, so a hostname publishing both "
+            "a public and a loopback/private A record passes validation on whichever "
+            "address it happens to return, and the SSRF lands on the next request. "
+            "Validation *succeeds* here, which is what makes this a linter rule rather "
+            "than a test — nothing raises. Resolve with getaddrinfo() and classify every "
+            "returned address, not just the first."
+        ),
+    ),
 )
 
 
