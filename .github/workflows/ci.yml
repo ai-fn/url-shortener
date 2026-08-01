@@ -15,6 +15,30 @@ env:
   UV_VERSION: "0.11.28"
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        # Anything outside docs/non-functional files counts as code. lint stays
+        # unconditional (cheap, catches stray issues in scripts/config too); test and
+        # build — the two jobs that actually need a running stack — skip otherwise.
+        # docker-compose.yml and this workflow file are deliberately NOT excluded:
+        # they're the only two YAML files in the repo, and both need build/test to
+        # validate them (the build job's whole job is catching a broken compose file).
+        with:
+          filters: |
+            code:
+              - '**'
+              - '!**/*.md'
+              - '!docs/**'
+              - '!LICENSE'
+              - '!.gitignore'
+
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -33,6 +57,8 @@ jobs:
       - run: uv run python scripts/check_invariants.py
 
   test:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
@@ -86,6 +112,8 @@ jobs:
           path: coverage.xml
 
   build:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
