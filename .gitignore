@@ -209,6 +209,7 @@ tempCodeRunnerFile.py
 # PyPI configuration file
 .pypirc
 .claude/
+C*E.md
 docs/adr/
 
 # Marimo

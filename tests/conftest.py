@@ -1,15 +1,11 @@
-"""Shared fixtures.
-
-Connection details are pinned here to compose-matching literals, so the same tests run
-against the compose stack and CI `services:` without branching — and so an ambient
-`DATABASE_URL` cannot retarget a run at a real database. Override with `TEST_*`.
-Integration tests need the dependencies already up; nothing here starts a container.
-"""
+"""Shared fixtures. Connection details are pinned to compose-matching literals so an
+ambient DATABASE_URL cannot retarget a run; override with `TEST_*`."""
 
 from __future__ import annotations
 
 import logging
 import os
+import uuid
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
@@ -25,9 +21,8 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.pool import NullPool
 
-# Assigned, not `setdefault`: a developer exporting DATABASE_URL to run alembic against
-# the compose stack otherwise had every integration test hit their real `shortener` db.
-# `TEST_*` is the explicit knob, which no ordinary shell has set but CI does.
+# Assigned, not `setdefault`: an ambient DATABASE_URL (e.g. for running alembic by
+# hand) must not retarget tests onto the real `shortener` db.
 _DEFAULTS = {
     "ENVIRONMENT": "test",
     "DATABASE_URL": "postgresql+asyncpg://shortener:shortener@localhost:5432/shortener_test",
@@ -43,13 +38,9 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 @pytest.fixture(autouse=True)
 def _isolate_process_state() -> Iterator[None]:
-    """Undo the two process-global mutations building an app performs.
-
-    `get_settings` is lru_cached, so the first call pins Settings for the session and
-    `monkeypatch.setenv` cannot reach it; `configure_logging` forces the root handler
-    and level. Autouse because the leak is invisible — results just stop depending on
-    the test's own setup.
-    """
+    """Undoes two process-global mutations building an app performs: `get_settings`
+    is lru_cached (monkeypatch.setenv can't reach it), and `configure_logging` forces
+    the root handler/level. Autouse — the leak is otherwise invisible."""
     from app.config import get_settings
 
     root = logging.getLogger()
@@ -67,12 +58,9 @@ def _isolate_process_state() -> Iterator[None]:
 
 @pytest.fixture
 def hermetic_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Strip every Settings-derived variable, so a test asserting a *default* does not
-    depend on the developer's shell or their `.env`.
-
-    Every casing is deleted, not just `FIELD.upper()`: pydantic-settings matches env
-    vars case-insensitively. Pair with `_env_file=None` on the constructor.
-    """
+    """Strips every Settings-derived env var, case-insensitively (pydantic-settings
+    matches that way), so a test asserting a *default* can't depend on the shell.
+    Pair with `_env_file=None` on the constructor."""
     from app.config import Settings
 
     for field in Settings.model_fields:
@@ -84,11 +72,8 @@ def hermetic_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 async def client() -> AsyncIterator[AsyncClient]:
-    """App under test WITHOUT lifespan — no Postgres/Redis needed.
-
-    For anything that does not touch a dependency, and for readiness cases with
-    substituted probes. Real dependencies live in test_readiness_integration.py.
-    """
+    """App under test without lifespan — no Postgres/Redis needed. Real dependencies
+    live in test_readiness_integration.py."""
     from app.config import Settings
     from app.main import create_app
 
@@ -109,10 +94,8 @@ async def client() -> AsyncIterator[AsyncClient]:
 
 @pytest.fixture
 async def live_client() -> AsyncIterator[AsyncClient]:
-    """App under test WITH the real lifespan — needs Postgres and Redis up.
-
-    `integration` only. Failing outright when they are down is the intended signal.
-    """
+    """App under test with the real lifespan — needs Postgres and Redis up.
+    `integration` only; failing outright when they're down is the intended signal."""
     from app.main import create_app
 
     app = create_app()
@@ -126,17 +109,10 @@ async def live_client() -> AsyncIterator[AsyncClient]:
 
 @pytest.fixture(scope="session")
 def _migrated_database() -> None:
-    """Applies migrations once per session, against TEST_ENV["DATABASE_URL"].
-
-    Runs here rather than as a separate CI step so local and CI schemas cannot
-    drift apart — the same reason connection details are pinned above rather than
-    read from an ambient DATABASE_URL.
-
-    Run in a worker thread: this fixture is pulled in (via `getfixturevalue`) from
-    inside async test fixtures, i.e. from inside pytest-asyncio's already-running
-    event loop. `migrations/env.py` calls `asyncio.run()`, which raises if a loop
-    is already running in the *same thread* — a separate thread has none.
-    """
+    """Applies migrations once per session. Runs in a worker thread: this is pulled
+    in via `getfixturevalue` from inside pytest-asyncio's running event loop, and
+    `migrations/env.py`'s `asyncio.run()` raises if called from a thread that
+    already has one — a separate thread has none."""
     from concurrent.futures import ThreadPoolExecutor
 
     from alembic import command
@@ -165,15 +141,10 @@ async def db_session(db_engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
 
 @pytest.fixture(autouse=True)
 async def _clean_tables(request: pytest.FixtureRequest) -> AsyncIterator[None]:
-    """Truncates mutable tables before every integration test, so one test's rows
-    never leak into the next. A no-op for unit tests, which never open a connection.
-
-    `_migrated_database` is pulled in lazily via `getfixturevalue`, not as a normal
-    parameter: a normal parameter is resolved before this function body runs at
-    all, which would run migrations against Postgres for every unit test too —
-    the exact ambient-dependency leak `_isolate_process_state` above exists to
-    prevent.
-    """
+    """Truncates mutable tables before every integration test; a no-op for unit
+    tests. `_migrated_database` is pulled in via `getfixturevalue`, not as a normal
+    parameter — a normal parameter would run migrations against Postgres for every
+    unit test too."""
     if request.node.get_closest_marker("integration") is None:
         yield
         return
@@ -182,16 +153,43 @@ async def _clean_tables(request: pytest.FixtureRequest) -> AsyncIterator[None]:
 
     engine = create_async_engine(TEST_ENV["DATABASE_URL"], poolclass=NullPool)
     async with engine.begin() as conn:
-        await conn.execute(text("TRUNCATE TABLE links RESTART IDENTITY CASCADE"))
+        # Both tables in one statement: links.owner_id is NOT NULL, so truncating
+        # users alone (even with CASCADE) would still fail without links listed too.
+        await conn.execute(text("TRUNCATE TABLE links, users RESTART IDENTITY CASCADE"))
     await engine.dispose()
 
-    # httpx's ASGITransport gives every request the same fake client address, so
-    # every integration test sharing `live_client`/`client` shares one rate-limit
-    # bucket in real Redis. Clear it, or the 30th test in a run starts seeing 429s
-    # that have nothing to do with what that test is checking.
+    # ASGITransport gives every request the same fake client address, so tests
+    # sharing `live_client`/`client` share one rate-limit bucket in real Redis —
+    # clear it, or a later test starts seeing 429s that aren't its own doing.
     redis_client = aioredis.from_url(TEST_ENV["REDIS_URL"])
     async for key in redis_client.scan_iter(match="rl:*"):
         await redis_client.delete(key)
     await redis_client.aclose()
 
     yield
+
+
+async def register_and_login(
+    live_client: AsyncClient, *, email: str | None = None
+) -> dict[str, str]:
+    """Registers a user and returns Authorization headers for its access token."""
+    credentials = {
+        "email": email or f"{uuid.uuid4()}@example.com",
+        "password": "correct horse battery staple",
+    }
+    await live_client.post("/api/v1/auth/register", json=credentials)
+    login = await live_client.post("/api/v1/auth/login", json=credentials)
+    token = login.json()["access_token"]
+    return {"Authorization": f"Bearer {token}"}
+
+
+async def insert_user(db_session: AsyncSession) -> uuid.UUID:
+    """Inserts a user row directly, for tests needing an owner_id without a login."""
+    from app.core.security import hash_password
+    from app.models.user import User
+
+    user = User(email=f"{uuid.uuid4()}@example.com", hashed_password=hash_password("x"))
+    db_session.add(user)
+    await db_session.commit()
+    await db_session.refresh(user)
+    return user.id

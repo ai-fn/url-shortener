@@ -7,14 +7,10 @@ import uuid
 from datetime import datetime
 from typing import Annotated
 
-import redis.asyncio as aioredis
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, HttpUrl, field_validator
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import client_ip, get_redis, get_session, get_settings_dep
-from app.config import Settings
-from app.core.rate_limit import RateLimiter, RateLimitUnavailable
+from app.api.deps import CurrentUserIdDep, SessionDep, SettingsDep, rate_limit_guard
 from app.core.url_validation import URLValidationError
 from app.models.link import Link
 from app.services import links as links_service
@@ -91,35 +87,28 @@ class LinkListResponse(BaseModel):
     items: list[LinkResponse]
 
 
-SessionDep = Annotated[AsyncSession, Depends(get_session)]
-SettingsDep = Annotated[Settings, Depends(get_settings_dep)]
-
-
-@router.post("", response_model=LinkResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=LinkResponse,
+    status_code=status.HTTP_201_CREATED,
+    # Route-level so it resolves before current_user_id's DB lookup — see
+    # rate_limit_guard's docstring. Fails closed: an unthrottled create endpoint
+    # is an open-redirect factory.
+    dependencies=[
+        Depends(
+            rate_limit_guard(
+                key_prefix="rl:create",
+                capacity=lambda settings: settings.rate_limit_create_per_minute,
+            )
+        )
+    ],
+)
 async def create_link(
-    request: Request,
     body: LinkCreateRequest,
     session: SessionDep,
     settings: SettingsDep,
-    redis: Annotated[aioredis.Redis, Depends(get_redis)],
+    current_user_id: CurrentUserIdDep,
 ) -> LinkResponse:
-    limiter = RateLimiter(
-        redis=redis, key_prefix="rl:create", capacity=settings.rate_limit_create_per_minute
-    )
-    try:
-        allowed = await limiter.allow(client_ip(request))
-    except RateLimitUnavailable as exc:
-        # Fails CLOSED: this is not the hot path, and an unthrottled create
-        # endpoint with no auth yet is a public open-redirect factory.
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="rate limiter unavailable",
-        ) from exc
-    if not allowed:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="rate limit exceeded"
-        )
-
     data = links_service.LinkCreate(
         target_url=str(body.target_url),
         custom_alias=body.custom_alias,
@@ -128,7 +117,9 @@ async def create_link(
         expires_at=body.expires_at,
     )
     try:
-        link = await links_service.create_link(session, data, public_host=settings.public_host)
+        link = await links_service.create_link(
+            session, data, owner_id=current_user_id, public_host=settings.public_host
+        )
     except URLValidationError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
@@ -154,10 +145,13 @@ async def create_link(
 async def list_links(
     session: SessionDep,
     settings: SettingsDep,
+    current_user_id: CurrentUserIdDep,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> LinkListResponse:
-    items = await links_service.list_links(session, limit=limit, offset=offset)
+    items = await links_service.list_links(
+        session, owner_id=current_user_id, limit=limit, offset=offset
+    )
     return LinkListResponse(
         items=[
             LinkResponse.from_link(link, public_base_url=str(settings.public_base_url))
@@ -171,9 +165,10 @@ async def get_link(
     link_id: uuid.UUID,
     session: SessionDep,
     settings: SettingsDep,
+    current_user_id: CurrentUserIdDep,
 ) -> LinkResponse:
     try:
-        link = await links_service.get_link(session, link_id)
+        link = await links_service.get_link(session, link_id, owner_id=current_user_id)
     except links_service.LinkNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="link not found") from exc
     return LinkResponse.from_link(link, public_base_url=str(settings.public_base_url))
@@ -185,11 +180,13 @@ async def update_link(
     body: LinkUpdateRequest,
     session: SessionDep,
     settings: SettingsDep,
+    current_user_id: CurrentUserIdDep,
 ) -> LinkResponse:
     try:
         link = await links_service.update_link(
             session,
             link_id,
+            owner_id=current_user_id,
             target_url=str(body.target_url) if body.target_url is not None else None,
             title=body.title,
             description=body.description,
@@ -211,8 +208,9 @@ async def update_link(
 async def delete_link(
     link_id: uuid.UUID,
     session: SessionDep,
+    current_user_id: CurrentUserIdDep,
 ) -> None:
     try:
-        await links_service.soft_delete(session, link_id)
+        await links_service.soft_delete(session, link_id, owner_id=current_user_id)
     except links_service.LinkNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="link not found") from exc

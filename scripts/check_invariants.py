@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 import re
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -48,6 +48,32 @@ class Rule:
     pattern: re.Pattern[str]
     message: str
     exempt_prefixes: tuple[str, ...] = ()
+    # Overrides `pattern.finditer` for rules a bounded regex can't express; `pattern`
+    # still runs first, to locate where `finder` should scan.
+    finder: Callable[[str, re.Pattern[str]], Iterator[re.Match[str]]] | None = None
+
+
+# A bounded class like `[^)]*` can't cross a `)`, so it stops at the first nested
+# call (e.g. `prefix=get_prefix()`) rather than the real call's own close paren.
+_FORBIDDEN_IN_ROUTER_CALL = re.compile(r"\b(?:dependencies|get_current_user)\b", re.IGNORECASE)
+
+
+def _router_registration_violations(
+    content: str, call_start: re.Pattern[str]
+) -> Iterator[re.Match[str]]:
+    for call in call_start.finditer(content):
+        open_paren = content.index("(", call.start())
+        depth = 0
+        for i in range(open_paren, len(content)):
+            if content[i] == "(":
+                depth += 1
+            elif content[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    match = _FORBIDDEN_IN_ROUTER_CALL.search(content, call.start(), i)
+                    if match:
+                        yield match
+                    break
 
 
 RULES: tuple[Rule, ...] = (
@@ -152,6 +178,57 @@ RULES: tuple[Rule, ...] = (
             "returned address, not just the first."
         ),
     ),
+    Rule(
+        name="auth-on-redirect-hot-path",
+        prefixes=("app/api/redirect.py",),
+        suffixes=(".py",),
+        pattern=re.compile(
+            r"get_current_user|HTTPBearer|app\.core\.security|app\.services\.auth|app\.api\.deps",
+            re.IGNORECASE,
+        ),
+        message=(
+            "The redirect path must never decode a JWT or look up a user per request, "
+            "and must not import app.api.deps even for an auth-free helper — that "
+            "module pulls in the whole auth stack, so importing from it defeats this "
+            "rule's ability to see what's actually reachable from the hot path. "
+            "GET /{code} is the hot path and is public by definition — auth belongs on "
+            "link mutations only. This would still pass every test that doesn't happen "
+            "to exercise an unauthenticated redirect, which is what makes it a linter "
+            "rule rather than a test."
+        ),
+    ),
+    Rule(
+        name="auth-on-redirect-router-registration",
+        prefixes=("app/main.py",),
+        suffixes=(".py",),
+        # `pattern` only locates the call; `finder` walks paren depth to its own `)`.
+        pattern=re.compile(r"include_router\s*\(\s*redirect\.router\b", re.IGNORECASE),
+        finder=_router_registration_violations,
+        message=(
+            "redirect.router's own include_router() call must never gain a "
+            "dependencies=[...] auth check. This is the router-level equivalent of "
+            "importing auth into app/api/redirect.py itself — same invariant, a "
+            "different place it can be silently reintroduced."
+        ),
+    ),
+    Rule(
+        name="global-middleware-registration",
+        prefixes=("app/",),
+        suffixes=(".py",),
+        # Flags any middleware registration, not just auth-looking ones: an opaque
+        # class name like `AuthMiddleware` can't be told apart from `CORSMiddleware`
+        # by content alone.
+        pattern=re.compile(r"\.add_middleware\s*\(|@[\w.]*\.middleware\s*\(", re.IGNORECASE),
+        message=(
+            "A new global middleware runs on every request, including GET /{code} — "
+            "neither auth-on-redirect rule can see it, since it touches neither "
+            "app/api/redirect.py nor redirect.router's own include_router() call. If "
+            "it decodes a JWT, looks up a user, or otherwise gates the redirect path, "
+            "it violates invariant 9. If it's provably auth-free (e.g. CORS, request "
+            "logging), add a named exemption to this rule and say why in the commit "
+            "message."
+        ),
+    ),
 )
 
 
@@ -193,7 +270,12 @@ def check(root: Path) -> list[str]:
             continue
 
         for rule in applicable:
-            for match in rule.pattern.finditer(content):
+            matches = (
+                rule.finder(content, rule.pattern)
+                if rule.finder is not None
+                else rule.pattern.finditer(content)
+            )
+            for match in matches:
                 line = content[: match.start()].count("\n") + 1
                 violations.append(f"{rel}:{line}  [{rule.name}]\n    {rule.message}")
 

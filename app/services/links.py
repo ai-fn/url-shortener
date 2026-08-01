@@ -16,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import short_code
+from app.core.db_errors import constraint_name
 from app.core.url_validation import validate_target_url
 from app.models.link import Link
 
@@ -60,7 +61,9 @@ def _validate_alias(alias: str) -> None:
         raise InvalidAliasError("alias is a reserved word")
 
 
-async def create_link(session: AsyncSession, data: LinkCreate, *, public_host: str) -> Link:
+async def create_link(
+    session: AsyncSession, data: LinkCreate, *, owner_id: uuid.UUID, public_host: str
+) -> Link:
     """Validate the target URL, then insert with either the caller's alias or a
     generated code. Raises URLValidationError, InvalidAliasError, LinkAliasTakenError
     or LinkCreationExhaustedError — the route maps each to its HTTP status."""
@@ -84,6 +87,7 @@ async def create_link(session: AsyncSession, data: LinkCreate, *, public_host: s
     for code in codes_to_try:
         link = Link(
             short_code=code,
+            owner_id=owner_id,
             target_url=data.target_url,
             title=data.title,
             description=data.description,
@@ -94,11 +98,7 @@ async def create_link(session: AsyncSession, data: LinkCreate, *, public_host: s
             await session.commit()
         except IntegrityError as exc:
             await session.rollback()
-            # asyncpg's dbapi wrapper doesn't proxy `constraint_name` onto exc.orig
-            # itself — it's on the raw asyncpg error, chained as __cause__ via
-            # SQLAlchemy's `raise translated_error from error`.
-            constraint_name = getattr(getattr(exc.orig, "__cause__", None), "constraint_name", None)
-            if constraint_name != _SHORT_CODE_UNIQUE_CONSTRAINT:
+            if constraint_name(exc) != _SHORT_CODE_UNIQUE_CONSTRAINT:
                 raise
             if data.custom_alias is not None:
                 raise LinkAliasTakenError(data.custom_alias) from exc
@@ -113,16 +113,28 @@ async def create_link(session: AsyncSession, data: LinkCreate, *, public_host: s
     ) from last_error
 
 
-async def get_link(session: AsyncSession, link_id: uuid.UUID) -> Link:
+async def get_link(session: AsyncSession, link_id: uuid.UUID, *, owner_id: uuid.UUID) -> Link:
+    """Folds "no such link" and "not yours" into the same LinkNotFoundError — a
+    caller must not learn a link exists by getting a different error for someone
+    else's id, the same enumeration-safety reasoning get_redirect_target uses."""
     link = await session.get(Link, link_id)
-    if link is None:
+    if link is None or link.owner_id != owner_id:
         raise LinkNotFoundError(str(link_id))
     return link
 
 
-async def list_links(session: AsyncSession, *, limit: int = 50, offset: int = 0) -> list[Link]:
+async def list_links(
+    session: AsyncSession, *, owner_id: uuid.UUID, limit: int = 50, offset: int = 0
+) -> list[Link]:
     result = await session.execute(
-        select(Link).order_by(Link.created_at.desc()).limit(limit).offset(offset)
+        select(Link)
+        .where(Link.owner_id == owner_id)
+        # id as a secondary key: created_at alone ties for rows inserted in the
+        # same transaction, and an untied ORDER BY can skip or repeat rows across
+        # separately-fetched pages.
+        .order_by(Link.created_at.desc(), Link.id.desc())
+        .limit(limit)
+        .offset(offset)
     )
     return list(result.scalars().all())
 
@@ -131,6 +143,7 @@ async def update_link(
     session: AsyncSession,
     link_id: uuid.UUID,
     *,
+    owner_id: uuid.UUID,
     target_url: str | None = None,
     title: str | object | None = ...,
     description: str | object | None = ...,
@@ -140,7 +153,7 @@ async def update_link(
 ) -> Link:
     """`...` (Ellipsis) means "leave unchanged" for nullable fields, since `None` is
     itself a valid value (clear the field) and can't double as "not provided"."""
-    link = await get_link(session, link_id)
+    link = await get_link(session, link_id, owner_id=owner_id)
 
     if target_url is not None:
         await validate_target_url(target_url, public_host=public_host)
@@ -159,10 +172,10 @@ async def update_link(
     return link
 
 
-async def soft_delete(session: AsyncSession, link_id: uuid.UUID) -> None:
+async def soft_delete(session: AsyncSession, link_id: uuid.UUID, *, owner_id: uuid.UUID) -> None:
     """Flips is_active rather than deleting the row, so a click event recorded
     earlier keeps a valid link_id to join against."""
-    link = await get_link(session, link_id)
+    link = await get_link(session, link_id, owner_id=owner_id)
     link.is_active = False
     await session.commit()
 

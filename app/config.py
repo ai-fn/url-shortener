@@ -49,6 +49,9 @@ class Settings(BaseSettings):
     ip_hash_key: SecretStr = Field(min_length=32)
 
     access_token_expire_minutes: int = 60
+    # Never caller-controlled: app/core/security.py always passes this as the sole
+    # entry of `algorithms=[...]` to jwt.decode, closing the alg-confusion class of bug.
+    jwt_algorithm: str = "HS256"
 
     # Long TTL plus explicit DEL on write; a short TTL does not help the one hot key.
     link_cache_ttl_seconds: int = 86_400
@@ -56,6 +59,10 @@ class Settings(BaseSettings):
 
     rate_limit_create_per_minute: int = 30
     rate_limit_notfound_per_minute: int = 120
+    # Fail closed like create: argon2id hashing is deliberately expensive, so an
+    # unthrottled endpoint is a CPU/memory amplification DoS via the hash itself.
+    rate_limit_login_per_minute: int = 10
+    rate_limit_register_per_minute: int = 10
 
     geoip_database_path: str = "/data/GeoLite2-City.mmdb"
 

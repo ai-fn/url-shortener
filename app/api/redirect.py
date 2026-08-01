@@ -14,8 +14,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
 
-from app.api.deps import client_ip
-from app.core.rate_limit import RateLimiter, RateLimitUnavailable
+from app.core.rate_limit import RateLimiter, RateLimitUnavailable, client_ip
 from app.core.short_code import is_reserved, is_valid_shape
 from app.core.url_validation import assert_safe_for_header
 from app.services import links as links_service

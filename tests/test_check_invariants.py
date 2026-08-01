@@ -1,7 +1,5 @@
-"""Tests for the invariant linter itself.
-
-Both halves are asserted: violations are caught, and legitimate code is not.
-"""
+"""Tests for the invariant linter itself: violations are caught, and legitimate
+code is not."""
 
 from __future__ import annotations
 
@@ -52,6 +50,44 @@ CASES: list[tuple[str, str, bool]] = [
         "def resolve(host):\n    return socket.gethostbyname(host)\n",
         True,
     ),
+    (
+        # The redirect path must never grow a per-request auth dependency.
+        "app/api/redirect.py",
+        "from app.api.deps import get_current_user\n",
+        True,
+    ),
+    (
+        # The vector the file-scoped rule above can't see: auth added at
+        # registration time, not inside redirect.py itself.
+        "app/main.py",
+        "app.include_router(redirect.router, dependencies=[Depends(get_current_user)])\n",
+        True,
+    ),
+    (
+        "app/main.py",
+        "app.include_router(\n"
+        "    redirect.router,\n"
+        "    dependencies=[Depends(get_current_user)],\n"
+        ")\n",
+        True,
+    ),
+    (
+        # Auth-free today, but app.api.deps pulls in the whole auth stack transitively.
+        "app/api/redirect.py",
+        "from app.api.deps import client_ip\n",
+        True,
+    ),
+    (
+        # Neither auth-on-redirect rule can see a global middleware.
+        "app/main.py",
+        "app.add_middleware(AuthMiddleware)\n",
+        True,
+    ),
+    (
+        "app/main.py",
+        '@app.middleware("http")\nasync def check_auth(request, call_next):\n    ...\n',
+        True,
+    ),
     # --- must NOT be flagged ---
     (
         "clickhouse/migrations/002_rollups.sql",
@@ -93,6 +129,35 @@ CASES: list[tuple[str, str, bool]] = [
         "async def resolve(host):\n"
         "    infos = await loop.getaddrinfo(host, None)\n"
         "    return [i[4][0] for i in infos]\n",
+        False,
+    ),
+    (
+        # Auth belongs on link mutations, not the redirect — but the rule scopes
+        # narrowly to app/api/redirect.py, so this must stay clean.
+        "app/api/links.py",
+        "from app.api.deps import get_current_user\n",
+        False,
+    ),
+    (
+        # The real registration: no dependencies=, so nothing in [^)]* reaches
+        # `get_current_user` before the call's own closing paren.
+        "app/main.py",
+        "app.include_router(redirect.router)\n",
+        False,
+    ),
+    (
+        # get_current_user used elsewhere in main.py, on a *different* router's
+        # registration, must not trip the rule scoped to redirect.router's own call.
+        "app/main.py",
+        "app.include_router(links.router, dependencies=[Depends(get_current_user)])\n"
+        "app.include_router(redirect.router)\n",
+        False,
+    ),
+    (
+        # Same call, but scoped outside app/ — a test fixture wiring up its own ASGI
+        # app for an unrelated check must not trip a rule meant for the real app.
+        "tests/conftest.py",
+        "app.add_middleware(AuthMiddleware)\n",
         False,
     ),
 ]
@@ -140,17 +205,10 @@ def test_skip_dirs_still_apply_inside_the_tree(tmp_path: Path) -> None:
 
 
 def test_drain_task_is_out_of_hot_path_scope(tmp_path: Path) -> None:
-    """HOT_PATH covers all of `app/`, so the exemption is what protects the drain task.
-
-    Asserted on the rules themselves: an exemption that stopped being applied would
-    otherwise look identical to one that works.
-
-    Defaults to requiring the exemption on every rule scoped to all of `app/`, so a
-    *new* HOT_PATH-scoped rule that needs it but omits it is still caught. A rule
-    added for an unrelated reason (e.g. DNS resolution safety, not Kafka/queue
-    blocking) is excluded here explicitly, by name, with the reason on file — never
-    silently, or this test stops meaning anything.
-    """
+    """Asserted on the rules themselves, not scanned output — an exemption that
+    stopped being applied would otherwise look identical to one that works. Defaults
+    to requiring HOT_PATH_EXEMPT on every app/-scoped rule; an unrelated one opts
+    out explicitly, by name, with a reason on file."""
     from scripts.check_invariants import HOT_PATH, HOT_PATH_EXEMPT, RULES
 
     assert any("app/events/".startswith(p) for p in HOT_PATH), (
@@ -159,6 +217,9 @@ def test_drain_task_is_out_of_hot_path_scope(tmp_path: Path) -> None:
     not_about_the_drain_task = {
         "single-address-dns-resolution": "flags unsafe DNS resolution, unrelated to "
         "awaiting Kafka/queue calls on the request path",
+        "global-middleware-registration": "flags middleware registration, unrelated to "
+        "awaiting Kafka/queue calls on the request path — the drain task registers no "
+        "middleware",
     }
     hot_path_rules = [
         r for r in RULES if r.prefixes == HOT_PATH and r.name not in not_about_the_drain_task

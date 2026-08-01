@@ -28,6 +28,7 @@ dependencies = [
     # Auth
     "pyjwt>=2.10",
     "pwdlib[argon2]>=0.2",
+    "email-validator>=2.2",
     # Observability
     "structlog>=24.4",
     "prometheus-fastapi-instrumentator>=7.0",

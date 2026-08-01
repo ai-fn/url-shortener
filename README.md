@@ -32,19 +32,25 @@ lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Features
 
-What's live today (milestone 2):
+What's live today (milestone 3):
 
+- **Auth + link ownership** — register/login issues a JWT bearer access token;
+  every link mutation requires one, and links carry a `NOT NULL owner_id`.
+  Cross-owner access to a link 404s, never 403s — the response never confirms
+  a link exists before confirming it's yours.
 - **Link CRUD** — create, read, update, and soft-delete short links via a REST API,
   with optional custom aliases, titles, descriptions, and expiry.
 - **SSRF-hardened URL validation** — every target URL is resolved and every
   returned address classified before storage, closing the classic bypasses
   (encoded/octal/decimal IPs, IPv4-mapped IPv6, CGNAT, the cloud metadata
   endpoint) rather than pattern-matching the input string.
-- **Atomic Redis rate limiting** — a Lua token bucket protects link creation and
-  the redirect's 404 budget, with an explicit fail-open/fail-closed policy per
-  endpoint instead of one default for both.
+- **Atomic Redis rate limiting** — a Lua token bucket protects link creation,
+  register/login, and the redirect's 404 budget, with an explicit
+  fail-open/fail-closed policy per endpoint instead of one default for both.
 - **Safe-by-construction redirects** — always `302` with `Cache-Control: no-store`,
   a reserved-path-aware catch-all route, and header-injection checks on the way out.
+  The redirect path never imports auth — it stays public and fast regardless of
+  what the auth surface does.
 - **Schema managed by Alembic**, driven by the same `Settings` the app itself reads,
   so migrations and the running service can never target different databases.
 
@@ -124,12 +130,22 @@ open http://localhost:8000/docs
 ## Usage
 
 ```bash
-# Create a short link
-curl -X POST localhost:8000/api/v1/links \
+# Register, then log in for a bearer token
+curl -X POST localhost:8000/api/v1/auth/register \
   -H 'content-type: application/json' \
+  -d '{"email": "you@example.com", "password": "correct horse battery staple"}'
+
+TOKEN=$(curl -sS -X POST localhost:8000/api/v1/auth/login \
+  -H 'content-type: application/json' \
+  -d '{"email": "you@example.com", "password": "correct horse battery staple"}' \
+  | jq -r .access_token)
+
+# Create a short link — link mutations require the token
+curl -X POST localhost:8000/api/v1/links \
+  -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
   -d '{"target_url": "https://example.com/", "title": "demo"}'
 
-# Follow it — 302, Cache-Control: no-store
+# Follow it — 302, Cache-Control: no-store. No token needed; the redirect is public.
 curl -i localhost:8000/<short_code>
 ```
 
@@ -160,7 +176,7 @@ app/
   api/            # Route handlers — thin adapters, no business logic
                   #   redirect.py is the hot path; changes here need unusual care
   services/       # Business logic — routes delegate here
-  core/           # Short codes, URL validation, rate limiting
+  core/           # Short codes, URL validation, rate limiting, auth (hashing + JWT)
   models/         # SQLAlchemy ORM models
 clickhouse/       # Server config for the compose container today;
                   #   numbered SQL migrations land with the analytics milestone

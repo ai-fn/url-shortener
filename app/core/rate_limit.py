@@ -17,7 +17,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import redis.asyncio as aioredis
+from fastapi import Request
 from redis.exceptions import RedisError
+
+
+def client_ip(request: Request) -> str:
+    """Best-effort client IP; no `X-Forwarded-For` trust without a configured
+    trusted-proxy list, or a client could spoof past the limiter. Lives here, not
+    app/api/deps.py, so redirect.py can use it without importing the auth stack
+    that module also wires up (invariant 9)."""
+    if request.client is None:
+        return "unknown"
+    return request.client.host
+
 
 # Reads current tokens, refills for elapsed time, spends one if available — all in a
 # single atomic step. Token count and timestamp are stored together so a bucket that

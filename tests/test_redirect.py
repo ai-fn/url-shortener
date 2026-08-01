@@ -9,21 +9,25 @@ from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.link import Link
+from tests.conftest import insert_user, register_and_login
 
 pytestmark = pytest.mark.integration
 
 
-async def _create_link(live_client: AsyncClient, **overrides: object) -> dict[str, object]:
+async def _create_link(
+    live_client: AsyncClient, **overrides: object
+) -> tuple[dict[str, object], dict[str, str]]:
     payload: dict[str, object] = {"target_url": "https://example.com/"}
     payload.update(overrides)
-    response = await live_client.post("/api/v1/links", json=payload)
+    headers = await register_and_login(live_client)
+    response = await live_client.post("/api/v1/links", json=payload, headers=headers)
     assert response.status_code == 201
     result: dict[str, object] = response.json()
-    return result
+    return result, headers
 
 
 async def test_redirect_follows_to_target_with_no_store(live_client: AsyncClient) -> None:
-    link = await _create_link(live_client)
+    link, _ = await _create_link(live_client)
 
     response = await live_client.get(f"/{link['short_code']}", follow_redirects=False)
 
@@ -38,8 +42,8 @@ async def test_unknown_code_is_404(live_client: AsyncClient) -> None:
 
 
 async def test_inactive_link_is_404(live_client: AsyncClient) -> None:
-    link = await _create_link(live_client)
-    delete_response = await live_client.delete(f"/api/v1/links/{link['id']}")
+    link, headers = await _create_link(live_client)
+    delete_response = await live_client.delete(f"/api/v1/links/{link['id']}", headers=headers)
     assert delete_response.status_code == 204
 
     response = await live_client.get(f"/{link['short_code']}", follow_redirects=False)
@@ -49,8 +53,10 @@ async def test_inactive_link_is_404(live_client: AsyncClient) -> None:
 async def test_expired_link_is_404(live_client: AsyncClient, db_session: AsyncSession) -> None:
     """Seeded directly via the DB: the API has no way to create an already-expired
     link, and that's fine — it shouldn't."""
+    owner_id = await insert_user(db_session)
     link = Link(
         short_code="expiredlink",
+        owner_id=owner_id,
         target_url="https://example.com/",
         expires_at=datetime.now(UTC) - timedelta(seconds=1),
     )
@@ -81,10 +87,9 @@ async def test_repeated_misses_eventually_rate_limited(live_client: AsyncClient)
 
 
 async def test_valid_hits_are_never_throttled_by_the_miss_budget(live_client: AsyncClient) -> None:
-    """The 404 budget must charge only actual misses. A shared rate limit that also
-    counted hits would 429 a popular link once enough legitimate clicks came from
-    one IP — exactly the case redirects must never lose to."""
-    link = await _create_link(live_client)
+    """A rate limit that also counted hits would 429 a popular link behind one
+    IP — exactly the case redirects must never lose to."""
+    link, _ = await _create_link(live_client)
 
     statuses = [
         (await live_client.get(f"/{link['short_code']}", follow_redirects=False)).status_code
