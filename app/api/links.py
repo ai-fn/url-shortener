@@ -10,7 +10,8 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 
-from app.api.deps import CurrentUserIdDep, SessionDep, SettingsDep, rate_limit_guard
+from app.api.deps import CurrentUserIdDep, RedisDep, SessionDep, SettingsDep, rate_limit_guard
+from app.cache.link_cache import LinkCacheUnavailable
 from app.core.url_validation import URLValidationError
 from app.models.link import Link
 from app.services import links as links_service
@@ -87,6 +88,18 @@ class LinkListResponse(BaseModel):
     items: list[LinkResponse]
 
 
+def _cache_unavailable(exc: LinkCacheUnavailable) -> HTTPException:
+    # update_link/delete_link only: the row is already committed at this point, and
+    # silently reporting success would mean the old (or reactivated) target keeps
+    # resolving from the cache for up to link_cache_ttl_seconds. Both are safe to
+    # retry — same link_id, no collision — unlike create_link, which swallows this
+    # error itself rather than raising it (see its docstring).
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="link cache unavailable; change was saved but is not yet live",
+    )
+
+
 @router.post(
     "",
     response_model=LinkResponse,
@@ -108,6 +121,7 @@ async def create_link(
     session: SessionDep,
     settings: SettingsDep,
     current_user_id: CurrentUserIdDep,
+    redis: RedisDep,
 ) -> LinkResponse:
     data = links_service.LinkCreate(
         target_url=str(body.target_url),
@@ -118,7 +132,7 @@ async def create_link(
     )
     try:
         link = await links_service.create_link(
-            session, data, owner_id=current_user_id, public_host=settings.public_host
+            session, data, owner_id=current_user_id, public_host=settings.public_host, redis=redis
         )
     except URLValidationError as exc:
         raise HTTPException(
@@ -181,6 +195,7 @@ async def update_link(
     session: SessionDep,
     settings: SettingsDep,
     current_user_id: CurrentUserIdDep,
+    redis: RedisDep,
 ) -> LinkResponse:
     try:
         link = await links_service.update_link(
@@ -193,6 +208,7 @@ async def update_link(
             expires_at=body.expires_at,
             is_active=body.is_active,
             public_host=settings.public_host,
+            redis=redis,
         )
     except links_service.LinkNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="link not found") from exc
@@ -200,6 +216,8 @@ async def update_link(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
         ) from exc
+    except LinkCacheUnavailable as exc:
+        raise _cache_unavailable(exc) from exc
 
     return LinkResponse.from_link(link, public_base_url=str(settings.public_base_url))
 
@@ -209,8 +227,11 @@ async def delete_link(
     link_id: uuid.UUID,
     session: SessionDep,
     current_user_id: CurrentUserIdDep,
+    redis: RedisDep,
 ) -> None:
     try:
-        await links_service.soft_delete(session, link_id, owner_id=current_user_id)
+        await links_service.soft_delete(session, link_id, owner_id=current_user_id, redis=redis)
     except links_service.LinkNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="link not found") from exc
+    except LinkCacheUnavailable as exc:
+        raise _cache_unavailable(exc) from exc

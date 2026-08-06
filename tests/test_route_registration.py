@@ -46,15 +46,15 @@ def _flatten_paths(routes: Iterable[BaseRoute]) -> list[str]:
 async def test_docs_and_health_and_robots_are_not_eaten_by_the_catch_all(
     client: AsyncClient,
 ) -> None:
-    for path in ("/docs", "/healthz", "/robots.txt", "/favicon.ico", "/openapi.json"):
+    for path in ("/docs", "/healthz", "/robots.txt", "/favicon.ico", "/openapi.json", "/metrics"):
         response = await client.get(path)
         assert response.status_code != 404, f"{path} was swallowed by the catch-all"
 
 
 async def test_reserved_prefix_used_as_a_code_returns_404(client: AsyncClient) -> None:
-    # "metrics" is reserved (Prometheus lands in a later milestone) but has no
-    # route yet, so a code that collides with it must still 404, not resolve.
-    response = await client.get("/metrics")
+    # "static" is reserved but has no route yet, so a code that collides with it
+    # must still 404, not resolve.
+    response = await client.get("/static")
     assert response.status_code == 404
 
 

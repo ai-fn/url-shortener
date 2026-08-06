@@ -133,6 +133,13 @@ async def db_engine(_migrated_database: None) -> AsyncIterator[AsyncEngine]:
 
 
 @pytest.fixture
+async def redis_client() -> AsyncIterator[aioredis.Redis]:
+    client = aioredis.from_url(TEST_ENV["REDIS_URL"])
+    yield client
+    await client.aclose()
+
+
+@pytest.fixture
 async def db_session(db_engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
     sessionmaker = async_sessionmaker(db_engine, expire_on_commit=False)
     async with sessionmaker() as session:
@@ -161,9 +168,12 @@ async def _clean_tables(request: pytest.FixtureRequest) -> AsyncIterator[None]:
     # ASGITransport gives every request the same fake client address, so tests
     # sharing `live_client`/`client` share one rate-limit bucket in real Redis —
     # clear it, or a later test starts seeing 429s that aren't its own doing.
+    # link:* too: a cached entry would otherwise outlive the TRUNCATE above and
+    # the next test would redirect to a row that no longer exists.
     redis_client = aioredis.from_url(TEST_ENV["REDIS_URL"])
-    async for key in redis_client.scan_iter(match="rl:*"):
-        await redis_client.delete(key)
+    for pattern in ("rl:*", "link:*"):
+        async for key in redis_client.scan_iter(match=pattern):
+            await redis_client.delete(key)
     await redis_client.aclose()
 
     yield

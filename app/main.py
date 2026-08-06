@@ -87,6 +87,8 @@ def _make_lifespan(settings: Settings) -> Callable[[FastAPI], AbstractAsyncConte
                 str(settings.redis_url),
                 decode_responses=False,
                 health_check_interval=30,
+                socket_connect_timeout=settings.redis_socket_connect_timeout_seconds,
+                socket_timeout=settings.redis_socket_timeout_seconds,
             )
             teardown.append(("redis", redis_client.aclose))
         except BaseException:

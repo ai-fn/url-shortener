@@ -57,6 +57,14 @@ class Settings(BaseSettings):
     link_cache_ttl_seconds: int = 86_400
     link_cache_negative_ttl_seconds: int = 60
 
+    # Bounds every Redis call the redirect hot path makes. Without these, redis-py
+    # blocks on the OS socket default (effectively unbounded) during a network
+    # partition that drops packets rather than refusing the connection outright — a
+    # blocked call falls through to Postgres eventually, but "eventually" is not
+    # "almost nothing".
+    redis_socket_connect_timeout_seconds: float = 0.5
+    redis_socket_timeout_seconds: float = 0.5
+
     rate_limit_create_per_minute: int = 30
     rate_limit_notfound_per_minute: int = 120
     # Fail closed like create: argon2id hashing is deliberately expensive, so an

@@ -7,18 +7,23 @@ requests can both see a code as free and both insert it.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+import redis.asyncio as aioredis
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.cache import link_cache
 from app.core import short_code
 from app.core.db_errors import constraint_name
 from app.core.url_validation import validate_target_url
 from app.models.link import Link
+
+logger = logging.getLogger(__name__)
 
 MAX_GENERATION_ATTEMPTS = 5
 
@@ -54,6 +59,17 @@ class LinkCreate:
     expires_at: datetime | None = None
 
 
+async def _invalidate_or_raise(redis: aioredis.Redis, code: str, *, message: str) -> None:
+    """Fail-closed cache invalidation shared by update_link and soft_delete: a caller
+    that can't invalidate must not report success on a mutation, or a stale/wrong
+    value keeps resolving from the cache for up to link_cache_ttl_seconds."""
+    try:
+        await link_cache.invalidate(redis, code)
+    except link_cache.LinkCacheUnavailable as exc:
+        logger.warning(message, extra={"code": code, "error": str(exc)})
+        raise
+
+
 def _validate_alias(alias: str) -> None:
     if not short_code.is_valid_shape(alias):
         raise InvalidAliasError("alias does not match the required shape")
@@ -62,11 +78,27 @@ def _validate_alias(alias: str) -> None:
 
 
 async def create_link(
-    session: AsyncSession, data: LinkCreate, *, owner_id: uuid.UUID, public_host: str
+    session: AsyncSession,
+    data: LinkCreate,
+    *,
+    owner_id: uuid.UUID,
+    public_host: str,
+    redis: aioredis.Redis,
 ) -> Link:
     """Validate the target URL, then insert with either the caller's alias or a
     generated code. Raises URLValidationError, InvalidAliasError, LinkAliasTakenError
-    or LinkCreationExhaustedError — the route maps each to its HTTP status."""
+    or LinkCreationExhaustedError — the route maps each to its HTTP status.
+
+    Unlike update_link/soft_delete, a cache-invalidation failure here is logged and
+    swallowed rather than raised: the row is already committed, and POST is not safe
+    to retry the way PATCH/DELETE are — a retry with the same custom_alias would
+    collide with the row this call just created and see LinkAliasTakenError, turning
+    a successful request into a confusing failure for the caller. There is also no
+    *stale* value at risk the way there is for update/delete: at worst, a negative
+    sentinel written by a probe that raced this commit outlives it, which self-heals
+    within link_cache_negative_ttl_seconds and is additionally guarded by the fencing
+    generation link_cache.invalidate() bumps — see app/services/redirect.py.
+    """
     await validate_target_url(data.target_url, public_host=public_host)
 
     if data.custom_alias is not None:
@@ -106,6 +138,13 @@ async def create_link(
             continue
         else:
             await session.refresh(link)
+            try:
+                await link_cache.invalidate(redis, link.short_code)
+            except link_cache.LinkCacheUnavailable as exc:
+                logger.warning(
+                    "post-create cache invalidation failed",
+                    extra={"code": link.short_code, "error": str(exc)},
+                )
             return link
 
     raise LinkCreationExhaustedError(
@@ -116,7 +155,7 @@ async def create_link(
 async def get_link(session: AsyncSession, link_id: uuid.UUID, *, owner_id: uuid.UUID) -> Link:
     """Folds "no such link" and "not yours" into the same LinkNotFoundError — a
     caller must not learn a link exists by getting a different error for someone
-    else's id, the same enumeration-safety reasoning get_redirect_target uses."""
+    else's id, the same enumeration-safety reasoning is_redirectable's callers use."""
     link = await session.get(Link, link_id)
     if link is None or link.owner_id != owner_id:
         raise LinkNotFoundError(str(link_id))
@@ -150,9 +189,18 @@ async def update_link(
     expires_at: datetime | object | None = ...,
     is_active: bool | None = None,
     public_host: str,
+    redis: aioredis.Redis,
 ) -> Link:
     """`...` (Ellipsis) means "leave unchanged" for nullable fields, since `None` is
-    itself a valid value (clear the field) and can't double as "not provided"."""
+    itself a valid value (clear the field) and can't double as "not provided".
+
+    Invalidates the cache after commit, never before: a DEL before commit lets a
+    concurrent reader repopulate the still-old row. May raise LinkCacheUnavailable —
+    unlike create_link, this must fail closed: a caller who can't invalidate must not
+    report success, or a stale, wrong target_url keeps resolving from the cache for
+    up to link_cache_ttl_seconds. PATCH is safe to retry (same link_id, no collision),
+    which create_link's custom-alias case is not.
+    """
     link = await get_link(session, link_id, owner_id=owner_id)
 
     if target_url is not None:
@@ -169,27 +217,42 @@ async def update_link(
 
     await session.commit()
     await session.refresh(link)
+    await _invalidate_or_raise(
+        redis, link.short_code, message="post-update cache invalidation failed"
+    )
     return link
 
 
-async def soft_delete(session: AsyncSession, link_id: uuid.UUID, *, owner_id: uuid.UUID) -> None:
+async def soft_delete(
+    session: AsyncSession, link_id: uuid.UUID, *, owner_id: uuid.UUID, redis: aioredis.Redis
+) -> None:
     """Flips is_active rather than deleting the row, so a click event recorded
-    earlier keeps a valid link_id to join against."""
+    earlier keeps a valid link_id to join against. Invalidates after commit and fails
+    closed on LinkCacheUnavailable, same reasoning as update_link: a takedown that
+    isn't reflected in the cache is a wrong redirect kept alive, not a stale absence."""
     link = await get_link(session, link_id, owner_id=owner_id)
     link.is_active = False
     await session.commit()
+    await _invalidate_or_raise(
+        redis, link.short_code, message="post-delete cache invalidation failed"
+    )
 
 
-async def get_redirect_target(session: AsyncSession, code: str) -> Link:
-    """Only returns a link that is active and unexpired. Callers must not
-    distinguish "not found" from "inactive" from "expired" in the response — that
-    lets an enumeration attacker map out which codes ever existed."""
+async def get_by_code(session: AsyncSession, code: str) -> Link | None:
+    """The raw row, with no active/expiry judgment — get_redirect_target's old job is
+    now split so the redirect cache can populate an entry for a dead link too. Use
+    is_redirectable() to make the same judgment the old function made inline."""
     result = await session.execute(select(Link).where(Link.short_code == code))
-    link = result.scalar_one_or_none()
+    return result.scalar_one_or_none()
 
-    if link is None or not link.is_active:
-        raise LinkNotFoundError(code)
-    if link.expires_at is not None and link.expires_at <= datetime.now(UTC):
-        raise LinkNotFoundError(code)
 
-    return link
+def is_redirectable(
+    *, is_active: bool, expires_at: datetime | None, now: datetime | None = None
+) -> bool:
+    """Pure predicate, callable against either a Postgres row or a cached payload —
+    callers must not distinguish "inactive" from "expired" from "not found" in their
+    response, or an enumeration attacker can map out which codes ever existed."""
+    if not is_active:
+        return False
+    effective_now = now if now is not None else datetime.now(UTC)
+    return expires_at is None or expires_at > effective_now

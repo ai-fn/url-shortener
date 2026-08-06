@@ -71,9 +71,9 @@ async def test_reserved_prefix_is_404_not_a_lookup(live_client: AsyncClient) -> 
     response = await live_client.get("/healthz")
     assert response.status_code == 200  # served by the real route, not the catch-all
 
-    # "metrics" is reserved (Prometheus lands later) but has no route yet, so a
-    # code colliding with it must still 404 rather than resolve.
-    response = await live_client.get("/metrics", follow_redirects=False)
+    # "static" is reserved but has no route yet, so a code colliding with it must
+    # still 404 rather than resolve.
+    response = await live_client.get("/static", follow_redirects=False)
     assert response.status_code == 404
 
 

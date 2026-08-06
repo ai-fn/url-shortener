@@ -88,7 +88,52 @@ CASES: list[tuple[str, str, bool]] = [
         '@app.middleware("http")\nasync def check_auth(request, call_next):\n    ...\n',
         True,
     ),
+    (
+        # A SET (or SETEX) outside app/cache/ is an invalidation trying to double as
+        # a write — the race a SET creates against an in-flight reader.
+        "app/services/links.py",
+        "async def invalidate(redis, code):\n    await redis.set(f'link:{code}', payload)\n",
+        True,
+    ),
+    (
+        "app/services/redirect.py",
+        "async def populate(cache_client, code, payload):\n"
+        "    await cache_client.setex(f'link:{code}', 60, payload)\n",
+        True,
+    ),
+    (
+        # An underscore-prefixed or otherwise non-`redis`/`cache`-leading identifier
+        # must not slip past `\b(?:redis|cache)` — `\b` alone doesn't break on `_`.
+        "app/services/links.py",
+        "async def invalidate(self, code):\n    await self._redis.set(f'link:{code}', payload)\n",
+        True,
+    ),
+    (
+        # Milestone 4 moves hot-path logic out of redirect.py itself — the rule must
+        # still see auth reached through the resolver it now delegates to.
+        "app/services/redirect.py",
+        "from app.api.deps import get_current_user\n",
+        True,
+    ),
+    (
+        "app/cache/link_cache.py",
+        "from app.core.security import decode_access_token\n",
+        True,
+    ),
     # --- must NOT be flagged ---
+    (
+        # The prescribed cache-aside write, from the one module allowed to make it.
+        "app/cache/link_cache.py",
+        "async def store(redis, code, link, *, ttl_seconds):\n"
+        "    await redis.setex(f'link:{code}', ttl_seconds, payload)\n",
+        False,
+    ),
+    (
+        # DEL is the only legal invalidation.
+        "app/services/links.py",
+        "async def invalidate(redis, code):\n    await redis.delete(f'link:{code}')\n",
+        False,
+    ),
     (
         "clickhouse/migrations/002_rollups.sql",
         "CREATE MATERIALIZED VIEW m TO t AS SELECT link_id, uniqState(event_id) FROM clicks_raw;",
@@ -220,6 +265,9 @@ def test_drain_task_is_out_of_hot_path_scope(tmp_path: Path) -> None:
         "global-middleware-registration": "flags middleware registration, unrelated to "
         "awaiting Kafka/queue calls on the request path — the drain task registers no "
         "middleware",
+        "cache-invalidated-with-set": "flags SET/SETEX as cache invalidation, unrelated "
+        "to awaiting Kafka/queue calls on the request path — it carries its own "
+        "exemption (app/cache/), not the drain task's",
     }
     hot_path_rules = [
         r for r in RULES if r.prefixes == HOT_PATH and r.name not in not_about_the_drain_task

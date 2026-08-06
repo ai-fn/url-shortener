@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+import redis.asyncio as aioredis
 from httpx import AsyncClient
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -186,7 +187,7 @@ async def test_cross_owner_access_is_404_not_403(live_client: AsyncClient, metho
 
 
 async def test_generated_code_never_lands_on_a_reserved_word(
-    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    db_session: AsyncSession, redis_client: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """short_code is unique but not reserved-checked, so a colliding code would
     insert fine and then be permanently unreachable behind the real route."""
@@ -198,14 +199,18 @@ async def test_generated_code_never_lands_on_a_reserved_word(
     owner_id = await insert_user(db_session)
     data = links_service.LinkCreate(target_url="https://example.com/")
     link = await links_service.create_link(
-        db_session, data, owner_id=owner_id, public_host="short.example.com"
+        db_session,
+        data,
+        owner_id=owner_id,
+        public_host="short.example.com",
+        redis=redis_client,
     )
 
     assert link.short_code == "abc1234"
 
 
 async def test_unrelated_integrity_error_is_not_treated_as_a_collision(
-    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+    db_session: AsyncSession, redis_client: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The retry loop must reinterpret only the short-code unique violation as a
     collision — any other IntegrityError has to surface, not become a misleading 503."""
@@ -224,7 +229,7 @@ async def test_unrelated_integrity_error_is_not_treated_as_a_collision(
     data = links_service.LinkCreate(target_url="https://example.com/")
     with pytest.raises(IntegrityError):
         await links_service.create_link(
-            db_session, data, owner_id=owner_id, public_host="short.example.com"
+            db_session, data, owner_id=owner_id, public_host="short.example.com", redis=redis_client
         )
 
 

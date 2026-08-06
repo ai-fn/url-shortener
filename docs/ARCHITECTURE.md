@@ -97,6 +97,36 @@ and disarming the guard.
   and stdlib records, JSON everywhere except `local`. uvicorn's default config declares
   no root logger, so without this an application record is dropped or escapes through
   `logging.lastResort` with its `extra` fields discarded.
+- `/metrics` exports Prometheus text via `prometheus_client` directly, not
+  `prometheus-fastapi-instrumentator` — that library's `.instrument()` installs a
+  global middleware that would run on every redirect for no benefit the hot path
+  needs, and would need its own exemption from the middleware-registration invariant.
+  `link_cache_lookups_total{result}` and `redirect_duration_seconds` are the two
+  collectors so far; more arrive with milestone 5's click pipeline.
+
+### Cache failure policy: reads fail open, invalidation fails closed except on create
+
+Redis being unreachable means different things depending on where it's seen, so the
+policy isn't one rule but three, laid out below — including why creation isn't grouped
+with the other two mutations.
+
+- **`GET /{code}`**: a `LinkCacheUnavailable` from the lookup is counted
+  (`link_cache_lookups_total{result="error"}`) and treated as a miss — the redirect
+  falls through to Postgres rather than failing. A failure to populate the cache
+  afterward is logged and swallowed for the same reason: a slow redirect beats a
+  failed one.
+- **`PATCH/DELETE /api/v1/links/{id}`**: invalidation runs after `commit()`, and if the
+  `DEL` raises, the route returns `503` instead of reporting success. The Postgres row
+  is already correct at that point; the response is telling the caller the change
+  isn't guaranteed live yet, not that it failed to save. Both are safe to retry — same
+  `link_id`, and `DEL` on an absent key is a no-op.
+- **`POST /api/v1/links`**: invalidation also runs after `commit()`, but a failure
+  there is logged and swallowed rather than raised — a `503` here would invite a retry,
+  and retrying a `POST` with the same `custom_alias` collides with the row the first
+  request already created, turning a success into a spurious `409`. There's also no
+  stale *old* value at risk on creation, only a possibly-stale negative sentinel that
+  self-heals within `link_cache_negative_ttl_seconds` and is further guarded by the
+  fencing generation `invalidate()` bumps (see `app/services/redirect.py`).
 
 ## Enforcement
 

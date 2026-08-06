@@ -113,3 +113,4 @@ def rate_limit_guard(
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 SettingsDep = Annotated[Settings, Depends(get_settings_dep)]
 CurrentUserIdDep = Annotated[uuid.UUID, Depends(get_current_user)]
+RedisDep = Annotated[aioredis.Redis, Depends(get_redis)]

@@ -1,23 +1,24 @@
-"""The hot path. GET /{code} -> Postgres -> 302. Changes here need unusual care —
-see the redirect-hot-path skill.
+"""The hot path. GET /{code} -> Redis -> Postgres on a miss -> 302. Changes here
+need unusual care — see the redirect-hot-path skill.
 
 Resources are pulled off `request.app.state` directly rather than via `Depends()`:
 FastAPI resolves every declared dependency before the handler body runs, which
 would defeat the reserved-prefix short-circuit below — a request for /favicon.ico
-would open a DB session before ever reaching the check that rejects it.
+would touch Redis before ever reaching the check that rejects it.
 
-No Redis link cache and no click event here: those arrive in milestone 4/5. This
-route only does what milestone 2 needs — do not pre-build them.
+No click event here: that arrives in milestone 5. This route only does what
+milestone 4 needs — do not pre-build it.
 """
 
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
 
+from app.core import metrics
 from app.core.rate_limit import RateLimiter, RateLimitUnavailable, client_ip
 from app.core.short_code import is_reserved, is_valid_shape
 from app.core.url_validation import assert_safe_for_header
-from app.services import links as links_service
+from app.services import redirect as redirect_service
 from app.services.links import LinkNotFoundError
 
 router = APIRouter()
@@ -66,16 +67,23 @@ async def redirect(code: str, request: Request) -> Response:
     if not is_valid_shape(code) or is_reserved(code):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
-    async with request.app.state.sessionmaker() as session:
-        try:
-            link = await links_service.get_redirect_target(session, code)
-        except LinkNotFoundError as exc:
-            await _reject_if_over_miss_budget(request)
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND) from exc
+    settings = request.app.state.settings
+    try:
+        with metrics.REDIRECT_DURATION.time():
+            link = await redirect_service.resolve(
+                redis=request.app.state.redis,
+                sessionmaker=request.app.state.sessionmaker,
+                code=code,
+                ttl_seconds=settings.link_cache_ttl_seconds,
+                negative_ttl_seconds=settings.link_cache_negative_ttl_seconds,
+            )
+            assert_safe_for_header(link.target_url)
+            response = Response(
+                status_code=status.HTTP_302_FOUND,
+                headers={"Location": link.target_url, "Cache-Control": _NO_STORE},
+            )
+    except LinkNotFoundError as exc:
+        await _reject_if_over_miss_budget(request)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND) from exc
 
-    assert_safe_for_header(link.target_url)
-
-    return Response(
-        status_code=status.HTTP_302_FOUND,
-        headers={"Location": link.target_url, "Cache-Control": _NO_STORE},
-    )
+    return response

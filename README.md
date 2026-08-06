@@ -32,8 +32,21 @@ lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Features
 
-What's live today (milestone 3):
+What's live today (milestone 4):
 
+- **Redis-cached redirects** — `GET /{code}` resolves from a Redis cache-aside layer
+  first; only a miss touches Postgres. Unknown codes get a short-TTL negative
+  sentinel, so enumeration can't turn into a Postgres load test. Cache reads fail open
+  (Redis down degrades to a Postgres-backed redirect, never a failure). Cache
+  invalidation fails closed on `PATCH`/`DELETE` (a mutation whose invalidation can't
+  be confirmed returns `503` rather than silently reporting success on a link that
+  isn't live yet) but fails open on `POST` — retrying a create with the same
+  `custom_alias` would collide with the row the first request already made, so a
+  cache hiccup there is logged instead of turned into a `503` that invites exactly
+  that retry. See [Roadmap](#status) for the reasoning split.
+- **`/metrics`** — `link_cache_lookups_total{result}` and `redirect_duration_seconds`,
+  exposed via `prometheus_client` directly rather than a global middleware, so
+  nothing extra runs on the redirect's hot path.
 - **Auth + link ownership** — register/login issues a JWT bearer access token;
   every link mutation requires one, and links carry a `NOT NULL owner_id`.
   Cross-owner access to a link 404s, never 403s — the response never confirms
@@ -54,8 +67,8 @@ What's live today (milestone 3):
 - **Schema managed by Alembic**, driven by the same `Settings` the app itself reads,
   so migrations and the running service can never target different databases.
 
-Targeted by the architecture, not yet built: the Redis redirect cache, Kafka click
-transport, and ClickHouse analytics pipeline. See [Roadmap](#status).
+Targeted by the architecture, not yet built: Kafka click transport and the
+ClickHouse analytics pipeline. See [Roadmap](#status).
 
 ## Architecture
 
@@ -176,7 +189,10 @@ app/
   api/            # Route handlers — thin adapters, no business logic
                   #   redirect.py is the hot path; changes here need unusual care
   services/       # Business logic — routes delegate here
-  core/           # Short codes, URL validation, rate limiting, auth (hashing + JWT)
+                  #   redirect.py is the cache-aside resolver the route delegates to
+  cache/          # Redis link cache — cache-aside reads, DEL-only invalidation
+  core/           # Short codes, URL validation, rate limiting, auth (hashing + JWT),
+                  #   Prometheus collectors
   models/         # SQLAlchemy ORM models
 clickhouse/       # Server config for the compose container today;
                   #   numbered SQL migrations land with the analytics milestone

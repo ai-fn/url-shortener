@@ -179,8 +179,26 @@ RULES: tuple[Rule, ...] = (
         ),
     ),
     Rule(
+        name="cache-invalidated-with-set",
+        prefixes=("app/",),
+        # The one module allowed to write cache keys, and only to populate — a
+        # SETEX there is the prescribed cache-aside write, not an invalidation.
+        exempt_prefixes=("app/cache/",),
+        suffixes=(".py",),
+        # `\b\w*` (not `\b`) so the match still starts at the true identifier boundary
+        # (after `.` or whitespace) but reaches in past a leading underscore or other
+        # prefix, e.g. `self._redis.set(...)` or `my_redis_client.set(...)`.
+        pattern=re.compile(r"\b\w*(?:redis|cache)\w*\s*\.\s*set\w*\s*\(", re.IGNORECASE),
+        message=(
+            "Invalidate the link cache with DEL, never SET. A SET races an "
+            "in-flight reader that fetched the old row before the write and writes "
+            "it back after, installing the stale value with a fresh TTL. Only "
+            "app/cache/ may write cache keys, and only to populate."
+        ),
+    ),
+    Rule(
         name="auth-on-redirect-hot-path",
-        prefixes=("app/api/redirect.py",),
+        prefixes=("app/api/redirect.py", "app/services/redirect.py", "app/cache/"),
         suffixes=(".py",),
         pattern=re.compile(
             r"get_current_user|HTTPBearer|app\.core\.security|app\.services\.auth|app\.api\.deps",
