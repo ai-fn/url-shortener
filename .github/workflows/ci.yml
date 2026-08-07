@@ -102,8 +102,10 @@ jobs:
 
       # `services:` rather than Testcontainers: the containers are healthy before the
       # step starts, so there is no in-job Docker startup cost.
+      # analytics_integration excluded: those need Kafka and ClickHouse, which this
+      # job deliberately does not start. The build job runs them against compose.
       - name: Integration tests
-        run: uv run pytest -m integration -q
+        run: uv run pytest -m "integration and not analytics_integration" -q
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -119,6 +121,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
 
       # Loaded as url-shortener:ci, which compose names as the api's `image:`, so `up`
       # reuses this build.
@@ -150,6 +156,43 @@ jobs:
           docker compose exec -T kafka \
             /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
             --describe --topic clicks
+
+      # Here rather than in the `test` job: `services:` cannot mount volumes, so a
+      # ClickHouse started there would miss users.d/profiles.xml and differ from this
+      # one on deduplicate_blocks_in_dependent_materialized_views.
+      - name: Analytics integration tests
+        env:
+          TEST_KAFKA_BOOTSTRAP_SERVERS: localhost:19092
+          TEST_CLICKHOUSE_HOST: localhost
+          TEST_CLICKHOUSE_PORT: "8123"
+        run: |
+          uv sync --frozen
+          uv run pytest -m analytics_integration -q
+
+      # The real-broker version of the ADR-0001 guarantee. The pytest case patches the
+      # producer; only this one exercises aiokafka against a genuinely absent broker,
+      # where an awaited send() would hang for request_timeout_ms (~40s).
+      - name: Redirects survive a stopped broker
+        run: |
+          set -euo pipefail
+          api=http://localhost:8000
+          creds='{"email":"ci-broker-down@example.com","password":"correct horse battery staple"}'
+          curl --fail --silent --show-error -X POST "$api/api/v1/auth/register" \
+               -H 'Content-Type: application/json' -d "$creds" > /dev/null
+          token=$(curl --fail --silent --show-error -X POST "$api/api/v1/auth/login" \
+                    -H 'Content-Type: application/json' -d "$creds" \
+                  | python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])')
+          code=$(curl --fail --silent --show-error -X POST "$api/api/v1/links" \
+                   -H 'Content-Type: application/json' -H "Authorization: Bearer $token" \
+                   -d '{"target_url":"https://example.com/"}' \
+                 | python3 -c 'import sys,json; print(json.load(sys.stdin)["short_code"])')
+
+          docker compose stop kafka
+          # --max-time 5: an awaited send() would blow well past this, which is the
+          # whole point of the assertion.
+          status=$(curl --silent --show-error --max-time 5 -o /dev/null \
+                        -w '%{http_code}' "$api/$code")
+          test "$status" = 302
 
       - name: Dump logs on failure
         if: failure()

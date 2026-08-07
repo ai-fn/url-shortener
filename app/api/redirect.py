@@ -6,24 +6,41 @@ FastAPI resolves every declared dependency before the handler body runs, which
 would defeat the reserved-prefix short-circuit below — a request for /favicon.ico
 would touch Redis before ever reaching the check that rejects it.
 
-No click event here: that arrives in milestone 5. This route only does what
-milestone 4 needs — do not pre-build it.
+The click event is enqueued, never sent: `put_nowait` on a bounded queue, drained by
+a background task that owns the Kafka producer. Awaiting `send()` here hangs the
+redirect for ~40s with the broker down (ADR-0001).
 """
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import time
+import uuid
+
 from fastapi import APIRouter, HTTPException, Request, Response, status
 
+from app.config import Settings
 from app.core import metrics
 from app.core.rate_limit import RateLimiter, RateLimitUnavailable, client_ip
 from app.core.short_code import is_reserved, is_valid_shape
 from app.core.url_validation import assert_safe_for_header
+from app.events.schema import ClickEvent
 from app.services import redirect as redirect_service
 from app.services.links import LinkNotFoundError
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 _NO_STORE = "no-store, no-cache, must-revalidate, max-age=0"
+
+# Enrichment failures are systematic, not one-off — a bad GeoIP database or config
+# error hits every request the same way. One `logger.exception` per interval, not
+# per request, or a synchronous full traceback lands on the hot path continuously.
+# The drop counter carries the signal either way.
+_ENRICH_ERROR_LOG_INTERVAL_SECONDS = 60.0
+_last_enrich_error_log = 0.0
 
 
 async def _reject_if_over_miss_budget(request: Request) -> None:
@@ -86,4 +103,39 @@ async def redirect(code: str, request: Request) -> Response:
         await _reject_if_over_miss_budget(request)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND) from exc
 
+    _enqueue_click(request, link.link_id, settings)
     return response
+
+
+def _enqueue_click(request: Request, link_id: uuid.UUID, settings: Settings) -> None:
+    """Synchronous by design. Enrichment is in-memory CPU work, and the IP is hashed
+    before it leaves the process — moving it downstream would put raw IPs in Kafka
+    for the whole retention window.
+
+    Runs after the response is already built: nothing here may turn a redirect that
+    already succeeded into a 500."""
+    try:
+        with metrics.ENRICH_DURATION.time():
+            event = ClickEvent.build(
+                link_id=link_id,
+                ip=client_ip(request),
+                user_agent=request.headers.get("user-agent", ""),
+                referer=request.headers.get("referer"),
+                ip_hash_key=settings.ip_hash_key.get_secret_value().encode(),
+                geoip_reader=request.app.state.geoip_reader,
+            )
+        request.app.state.click_queue.put_nowait(event)
+    except asyncio.QueueFull:
+        metrics.CLICKS_DROPPED.labels(reason="queue_full").inc()
+    except Exception:
+        metrics.CLICKS_DROPPED.labels(reason="enrich_failed").inc()
+        _log_enrich_failure_throttled()
+
+
+def _log_enrich_failure_throttled() -> None:
+    global _last_enrich_error_log
+    now = time.monotonic()
+    if now - _last_enrich_error_log < _ENRICH_ERROR_LOG_INTERVAL_SECONDS:
+        return
+    _last_enrich_error_log = now
+    logger.exception("dropped click event")

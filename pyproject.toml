@@ -17,8 +17,9 @@ dependencies = [
     "alembic>=1.14",
     # Redis — cache and rate limiter
     "redis>=5.2",
-    # Kafka — click event transport
-    "aiokafka>=0.12",
+    # Kafka — click event transport. The lz4 extra is required, not an optimisation:
+    # aiokafka raises at construction if the codec its compression_type names is absent.
+    "aiokafka[lz4]>=0.12",
     # ClickHouse — analytics read path only
     "clickhouse-connect>=0.8",
     # Enrichment. maxminddb's pure-Python fallback is ~10x slower than its C
@@ -94,7 +95,11 @@ ignore_missing_imports = true
 asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
-    "integration: requires Postgres/Redis/Kafka/ClickHouse (deselect with -m 'not integration')",
+    "integration: requires Postgres/Redis (deselect with -m 'not integration')",
+    # Separate from `integration` because GitHub Actions `services:` cannot mount
+    # volumes, so the CI test job cannot stand up a ClickHouse matching compose's.
+    # These run in the build job, against the real stack.
+    "analytics_integration: also requires Kafka/ClickHouse and applied ClickHouse migrations",
 ]
 
 [tool.coverage.run]

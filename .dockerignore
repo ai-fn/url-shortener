@@ -10,7 +10,10 @@ __pycache__
 tests
 docs
 clickhouse
+# The runtime image runs the ClickHouse migrations; server config stays out of it.
+!clickhouse/migrations
 scripts
+!scripts/apply_clickhouse_migrations.py
 docker-compose*.yml
 Dockerfile
 .env

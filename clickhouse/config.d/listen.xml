@@ -1,0 +1,11 @@
+<clickhouse>
+    <!-- Restores what the image's own docker_related_config.xml sets: mounting
+         ./clickhouse/config.d over /etc/clickhouse-server/config.d shadows that file,
+         leaving ClickHouse bound to container-localhost only. Both families with
+         listen_try, or the healthcheck's `localhost` resolving to ::1 fails to connect
+         on a host without IPv6 — and compose then reports the service unhealthy while
+         the server is running fine. -->
+    <listen_host>::</listen_host>
+    <listen_host>0.0.0.0</listen_host>
+    <listen_try>1</listen_try>
+</clickhouse>

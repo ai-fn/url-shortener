@@ -29,6 +29,14 @@ _DEFAULTS = {
     "REDIS_URL": "redis://localhost:6379/0",
     "SECRET_KEY": "test-only-insecure-key-000000000000000000",
     "IP_HASH_KEY": "test-only-insecure-key-111111111111111111",
+    # The compose EXTERNAL listener and published ports: tests run on the host, not
+    # inside the compose network where `kafka:9092` resolves.
+    "KAFKA_BOOTSTRAP_SERVERS": "localhost:19092",
+    "CLICKHOUSE_HOST": "localhost",
+    "CLICKHOUSE_PORT": "8123",
+    "CLICKHOUSE_DATABASE": "analytics",
+    "CLICKHOUSE_USER": "analytics",
+    "CLICKHOUSE_PASSWORD": "dev-only-insecure-clickhouse",
 }
 TEST_ENV = {name: os.environ.get(f"TEST_{name}", default) for name, default in _DEFAULTS.items()}
 os.environ.update(TEST_ENV)
@@ -177,6 +185,61 @@ async def _clean_tables(request: pytest.FixtureRequest) -> AsyncIterator[None]:
     await redis_client.aclose()
 
     yield
+
+
+_CLICKHOUSE_TABLES = ("clicks_raw", "clicks_dlq", "clicks_hourly", "clicks_daily_dims")
+
+
+@pytest.fixture(scope="session")
+def _migrated_clickhouse() -> None:
+    """Applies clickhouse/migrations once per session. No worker thread needed, unlike
+    `_migrated_database`: clickhouse-connect is a plain sync HTTP client with no event
+    loop of its own."""
+    from scripts.apply_clickhouse_migrations import apply, connect
+
+    client = connect()
+    try:
+        apply(client)
+    finally:
+        client.close()
+
+
+@pytest.fixture
+def clickhouse_client(_migrated_clickhouse: None) -> Iterator[object]:
+    import clickhouse_connect
+
+    client = clickhouse_connect.get_client(
+        host=TEST_ENV["CLICKHOUSE_HOST"],
+        port=int(TEST_ENV["CLICKHOUSE_PORT"]),
+        username=TEST_ENV["CLICKHOUSE_USER"],
+        password=TEST_ENV["CLICKHOUSE_PASSWORD"],
+        database=TEST_ENV["CLICKHOUSE_DATABASE"],
+    )
+    yield client
+    client.close()
+
+
+@pytest.fixture
+async def kafka_producer() -> AsyncIterator[object]:
+    """A raw producer, for publishing what the app never would — a malformed message."""
+    from aiokafka import AIOKafkaProducer
+
+    producer = AIOKafkaProducer(bootstrap_servers=TEST_ENV["KAFKA_BOOTSTRAP_SERVERS"])
+    await producer.start()
+    yield producer
+    await producer.stop()
+
+
+@pytest.fixture(autouse=True)
+def _clean_clickhouse_tables(request: pytest.FixtureRequest) -> None:
+    """Analytics tests assert on absolute counts, so they need an empty start. Gated on
+    the marker: unit tests must never reach for ClickHouse."""
+    if request.node.get_closest_marker("analytics_integration") is None:
+        return
+
+    client = request.getfixturevalue("clickhouse_client")
+    for table in _CLICKHOUSE_TABLES:
+        client.command(f"TRUNCATE TABLE IF EXISTS {table}")
 
 
 async def register_and_login(

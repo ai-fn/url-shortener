@@ -101,8 +101,19 @@ and disarming the guard.
   `prometheus-fastapi-instrumentator` — that library's `.instrument()` installs a
   global middleware that would run on every redirect for no benefit the hot path
   needs, and would need its own exemption from the middleware-registration invariant.
-  `link_cache_lookups_total{result}` and `redirect_duration_seconds` are the two
-  collectors so far; more arrive with milestone 5's click pipeline.
+  `link_cache_lookups_total{result}` and `redirect_duration_seconds` cover the cache
+  and the response; `clicks_produced_total`, `clicks_dropped_total{reason}`,
+  `click_queue_depth` and `enrich_duration_seconds` cover the click pipeline. A
+  sustained non-zero drop rate means the drain task or the broker needs attention —
+  it is the only outward sign, since nothing on the redirect path fails when Kafka is
+  gone.
+- ClickHouse migrations are numbered SQL under `clickhouse/migrations/`, one statement
+  per file, applied by `scripts/apply_clickhouse_migrations.py` against a
+  `schema_migrations` table. It runs as the one-shot `migrate-clickhouse` compose
+  service, for the same reason `migrate` exists for Alembic: N replicas starting
+  together must not race the same DDL. Every statement is idempotent — `IF NOT EXISTS`
+  on creates, `MODIFY`/`REPLACE` on alters — so a crash between executing and
+  recording self-heals on the next run.
 
 ### Cache failure policy: reads fail open, invalidation fails closed except on create
 

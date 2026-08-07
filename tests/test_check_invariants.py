@@ -205,6 +205,49 @@ CASES: list[tuple[str, str, bool]] = [
         "app.add_middleware(AuthMiddleware)\n",
         False,
     ),
+    (
+        # An ad-hoc read consumes the messages, so they never reach clicks_raw.
+        "clickhouse/migrations/010_debug.sql",
+        "SELECT event_id FROM kafka_clicks_queue LIMIT 10;",
+        True,
+    ),
+    (
+        # The span that exempts an MV is bounded at its `;`, so a bare read after one
+        # is judged on its own rather than sheltering under it.
+        "clickhouse/migrations/011_mixed.sql",
+        "CREATE MATERIALIZED VIEW clicks_ingest_mv TO clicks_raw AS\n"
+        "SELECT event_id FROM kafka_clicks_queue WHERE length(_error) = 0;\n"
+        "SELECT count() FROM kafka_clicks_queue;\n",
+        True,
+    ),
+    (
+        "clickhouse/migrations/012_ingest.sql",
+        "CREATE MATERIALIZED VIEW clicks_ingest_mv TO clicks_raw AS\n"
+        "SELECT event_id, link_id, ts FROM kafka_clicks_queue WHERE length(_error) = 0;\n",
+        False,
+    ),
+    (
+        "clickhouse/migrations/013_dlq.sql",
+        "CREATE MATERIALIZED VIEW clicks_dlq_mv TO clicks_dlq AS\n"
+        "SELECT _raw_message AS raw, _error AS error FROM kafka_clicks_queue\n"
+        "WHERE length(_error) > 0;\n",
+        False,
+    ),
+    (
+        # A third MV on the queue table, correctly filtered — the exemption is by
+        # name, not by shape, so this must still be flagged.
+        "clickhouse/migrations/015_extra_ingest.sql",
+        "CREATE MATERIALIZED VIEW clicks_extra_mv TO clicks_extra AS\n"
+        "SELECT event_id, link_id FROM kafka_clicks_queue WHERE length(_error) = 0;\n",
+        True,
+    ),
+    (
+        # Rollups read clicks_raw, never the queue table.
+        "clickhouse/migrations/014_rollup.sql",
+        "CREATE MATERIALIZED VIEW h TO clicks_hourly AS\n"
+        "SELECT link_id, uniqState(event_id) AS clicks_state FROM clicks_raw GROUP BY link_id;\n",
+        False,
+    ),
 ]
 
 

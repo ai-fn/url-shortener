@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 
 import pytest
 from fastapi import FastAPI
 
 from app.config import Settings
-from app.main import _close_all, create_app
+from app.main import _close_all, _stop_click_pipeline, create_app
 
 _REQUIRED = {
     "secret_key": "test-only-insecure-key-000000000000000000",
@@ -91,6 +92,74 @@ async def test_cancellation_during_teardown_still_disposes_the_engine() -> None:
         await _close_all(("redis", cancelled), ("postgres engine", dispose))
 
     assert disposed, "cancellation during redis teardown must not skip engine.dispose()"
+
+
+async def test_stop_click_pipeline_stops_the_producer_when_drain_task_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A drain_task that dies with a non-cancellation exception before stop_drain
+    ever calls cancel() must not skip producer.stop() — that leaks the aiokafka
+    client and its sender task."""
+    stopped = False
+
+    async def fake_flush(*_args: object, **_kwargs: object) -> None:
+        pass
+
+    monkeypatch.setattr("app.events.producer.flush_remaining", fake_flush)
+
+    class _FakeProducer:
+        async def stop(self) -> None:
+            nonlocal stopped
+            stopped = True
+
+    async def boom() -> None:
+        raise RuntimeError("drain died")
+
+    drain_task = asyncio.create_task(boom())
+    with contextlib.suppress(RuntimeError):
+        await drain_task
+
+    with pytest.raises(RuntimeError):
+        await _stop_click_pipeline(
+            _FakeProducer(),  # type: ignore[arg-type]
+            asyncio.Queue(),
+            "clicks",
+            drain_task=drain_task,
+            timeout_seconds=0.1,
+        )
+
+    assert stopped, "producer.stop() must run even when drain_task failed"
+
+
+async def test_stop_click_pipeline_stops_the_producer_when_flush_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shutdown-deadline CancelledError raised inside flush_remaining (which only
+    catches its own delivery errors) must not skip producer.stop() either."""
+    stopped = False
+
+    async def fake_flush(*_args: object, **_kwargs: object) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("app.events.producer.flush_remaining", fake_flush)
+
+    class _FakeProducer:
+        async def stop(self) -> None:
+            nonlocal stopped
+            stopped = True
+
+    drain_task = asyncio.create_task(asyncio.sleep(3600))
+
+    with pytest.raises(asyncio.CancelledError):
+        await _stop_click_pipeline(
+            _FakeProducer(),  # type: ignore[arg-type]
+            asyncio.Queue(),
+            "clicks",
+            drain_task=drain_task,
+            timeout_seconds=0.1,
+        )
+
+    assert stopped, "producer.stop() must run even when flush_remaining is cancelled"
 
 
 async def test_close_all_logs_rather_than_raising_on_ordinary_errors() -> None:

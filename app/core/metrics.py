@@ -10,6 +10,7 @@ from prometheus_client import (
     CONTENT_TYPE_LATEST,
     CollectorRegistry,
     Counter,
+    Gauge,
     Histogram,
     generate_latest,
 )
@@ -26,6 +27,34 @@ LINK_CACHE_LOOKUPS = Counter(
 REDIRECT_DURATION = Histogram(
     "redirect_duration_seconds",
     "Time spent resolving and serving GET /{code}.",
+    registry=REGISTRY,
+)
+
+
+CLICKS_PRODUCED = Counter(
+    "clicks_produced_total",
+    "Click events acknowledged by Kafka.",
+    registry=REGISTRY,
+)
+
+CLICKS_DROPPED = Counter(
+    "clicks_dropped_total",
+    "Click events discarded rather than delivered, by reason.",
+    labelnames=["reason"],  # queue_full | send_failed | enrich_failed
+    registry=REGISTRY,
+)
+
+# Set via set_function in lifespan: the queue does not exist at import time, and a
+# depth sampled at scrape time is the only one worth reporting anyway.
+CLICK_QUEUE_DEPTH = Gauge(
+    "click_queue_depth",
+    "Click events waiting in the in-process queue.",
+    registry=REGISTRY,
+)
+
+ENRICH_DURATION = Histogram(
+    "enrich_duration_seconds",
+    "Time spent enriching a click event on the redirect path.",
     registry=REGISTRY,
 )
 

@@ -39,6 +39,10 @@ COPY --from=deps /usr/local /usr/local
 COPY --chown=app:app app/ ./app/
 COPY --chown=app:app alembic.ini ./
 COPY --chown=app:app migrations/ ./migrations/
+# Only migrations/ under clickhouse/: config.d and users.d are server-side and are
+# mounted into the clickhouse container, not baked into this image.
+COPY --chown=app:app clickhouse/migrations/ ./clickhouse/migrations/
+COPY --chown=app:app scripts/apply_clickhouse_migrations.py ./scripts/
 
 USER app
 EXPOSE 8000

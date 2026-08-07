@@ -32,8 +32,16 @@ lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Features
 
-What's live today (milestone 4):
+What's live today:
 
+- **Click analytics pipeline** — every redirect enriches an event in-process (HMAC'd
+  /24-truncated IP, UA parse, GeoIP country, bot detection) and hands it to a bounded
+  queue with `put_nowait`. A background drain task owns the Kafka producer and is the
+  only place a send is ever awaited, so a broker outage costs counted drops rather
+  than slow redirects. ClickHouse consumes the topic through a Kafka engine table
+  split into two materialized views — good rows to `clicks_raw`, unparseable ones to
+  `clicks_dlq` — and rolls up hourly and daily with `uniqState(event_id)`, which stays
+  correct under the at-least-once redelivery the Kafka engine guarantees.
 - **Redis-cached redirects** — `GET /{code}` resolves from a Redis cache-aside layer
   first; only a miss touches Postgres. Unknown codes get a short-TTL negative
   sentinel, so enumeration can't turn into a Postgres load test. Cache reads fail open
@@ -43,10 +51,12 @@ What's live today (milestone 4):
   isn't live yet) but fails open on `POST` — retrying a create with the same
   `custom_alias` would collide with the row the first request already made, so a
   cache hiccup there is logged instead of turned into a `503` that invites exactly
-  that retry. See [Roadmap](#status) for the reasoning split.
-- **`/metrics`** — `link_cache_lookups_total{result}` and `redirect_duration_seconds`,
-  exposed via `prometheus_client` directly rather than a global middleware, so
-  nothing extra runs on the redirect's hot path.
+  that retry. The reasoning split is in
+  [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+- **`/metrics`** — `link_cache_lookups_total{result}`, `redirect_duration_seconds`,
+  `clicks_produced_total`, `clicks_dropped_total{reason}`, `click_queue_depth` and
+  `enrich_duration_seconds`, exposed via `prometheus_client` directly rather than a
+  global middleware, so nothing extra runs on the redirect's hot path.
 - **Auth + link ownership** — register/login issues a JWT bearer access token;
   every link mutation requires one, and links carry a `NOT NULL owner_id`.
   Cross-owner access to a link 404s, never 403s — the response never confirms
@@ -67,8 +77,8 @@ What's live today (milestone 4):
 - **Schema managed by Alembic**, driven by the same `Settings` the app itself reads,
   so migrations and the running service can never target different databases.
 
-Targeted by the architecture, not yet built: Kafka click transport and the
-ClickHouse analytics pipeline. See [Roadmap](#status).
+Targeted by the architecture, not yet built: the analytics read API over the
+ClickHouse rollups.
 
 ## Architecture
 
@@ -193,11 +203,13 @@ app/
   cache/          # Redis link cache — cache-aside reads, DEL-only invalidation
   core/           # Short codes, URL validation, rate limiting, auth (hashing + JWT),
                   #   Prometheus collectors
+  events/         # Click event schema, enrichment, Kafka producer + drain task
   models/         # SQLAlchemy ORM models
-clickhouse/       # Server config for the compose container today;
-                  #   numbered SQL migrations land with the analytics milestone
+clickhouse/       # Server config for the compose container, plus numbered SQL
+                  #   migrations: Kafka engine table, ingest + DLQ MVs, raw, rollups
 migrations/       # Alembic, Postgres only
 scripts/          # check_invariants.py — the committed architectural gate
+                  # apply_clickhouse_migrations.py — idempotent ClickHouse runner
 tests/            # Unit (no containers) + integration (needs the compose stack)
 docs/
   ARCHITECTURE.md # The full design

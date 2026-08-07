@@ -57,6 +57,26 @@ class Rule:
 # call (e.g. `prefix=get_prefix()`) rather than the real call's own close paren.
 _FORBIDDEN_IN_ROUTER_CALL = re.compile(r"\b(?:dependencies|get_current_user)\b", re.IGNORECASE)
 
+_KAFKA_QUEUE_READ = re.compile(r"\bFROM\s+kafka_clicks_queue\b", re.IGNORECASE)
+
+# Bounded at `;` like the SELECT * rule, so a second statement in the same file is
+# judged on its own rather than sheltering under an earlier MV's span. Named, not
+# any MV: the rule's own message promises only clicks_ingest_mv and clicks_dlq_mv
+# may read the queue table, so a third MV on it must not be silently exempted.
+_INGEST_MV = re.compile(
+    r"CREATE\s+MATERIALIZED\s+VIEW\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+    r"(?:clicks_ingest_mv|clicks_dlq_mv)\b[^;]*?\bFROM\s+kafka_clicks_queue\b[^;]*?;",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _kafka_queue_read_violations(content: str, pattern: re.Pattern[str]) -> Iterator[re.Match[str]]:
+    """Every read of the queue table except the ones inside an MV definition."""
+    allowed = [mv.span() for mv in _INGEST_MV.finditer(content)]
+    for read in pattern.finditer(content):
+        if not any(start <= read.start() < end for start, end in allowed):
+            yield read
+
 
 def _router_registration_violations(
     content: str, call_start: re.Pattern[str]
@@ -122,6 +142,18 @@ RULES: tuple[Rule, ...] = (
             "SELECT * in a materialized view misaligns data silently. The MV's SELECT "
             "is frozen at creation; once column order drifts, values land in the wrong "
             "columns with no error. Enumerate columns explicitly."
+        ),
+    ),
+    Rule(
+        name="select-from-kafka-engine-table",
+        prefixes=("clickhouse/",),
+        suffixes=(".sql",),
+        pattern=_KAFKA_QUEUE_READ,
+        finder=_kafka_queue_read_violations,
+        message=(
+            "Reading a Kafka engine table consumes the messages — they are then gone "
+            "for the ingest MV and never reach clicks_raw. Only clicks_ingest_mv and "
+            "clicks_dlq_mv may read kafka_clicks_queue. Query clicks_raw or a rollup."
         ),
     ),
     Rule(

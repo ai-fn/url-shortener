@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     kafka_clicks_topic: str = "clicks"
     # Bounded: a broker outage drops events instead of growing memory.
     click_queue_maxsize: int = 10_000
+    # Best-effort flush before the drain task is cancelled. Every deploy is an
+    # ordinary shutdown, so without a window the last seconds of clicks are lost
+    # routinely rather than exceptionally.
+    click_drain_shutdown_timeout_seconds: float = 2.0
 
     clickhouse_host: str = "clickhouse"
     clickhouse_port: int = 8123

@@ -111,7 +111,10 @@ services:
       nofile: {soft: 262144, hard: 262144}
     mem_limit: 2g
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      # 127.0.0.1, not localhost: busybox wget resolves localhost to ::1 first, and
+      # listen_try skips the ::  bind on hosts without IPv6 — leaving a server that is
+      # up and reachable reported as unhealthy.
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8123/ping"]
       <<: *healthcheck-defaults
 
   migrate:
@@ -126,6 +129,34 @@ services:
     command: ["alembic", "upgrade", "head"]
     environment:
       ENVIRONMENT: local
+      DATABASE_URL: postgresql+asyncpg://shortener:shortener@postgres:5432/shortener
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: dev-only-insecure-change-me-0000000000000000
+      IP_HASH_KEY: dev-only-insecure-change-me-1111111111111111
+
+  migrate-clickhouse:
+    build:
+      context: .
+      target: runtime
+    image: url-shortener:ci
+    depends_on:
+      clickhouse: {condition: service_healthy}
+      # Creates a Kafka engine table targeting the clicks topic; without this, a
+      # first `up` can beat kafka-init's --create and produce confusing broker errors.
+      kafka-init: {condition: service_completed_successfully}
+    restart: "no"
+    mem_limit: 256m
+    command: ["python", "scripts/apply_clickhouse_migrations.py"]
+    environment:
+      # Running a file puts its own directory on sys.path, not the workdir, so `app`
+      # is otherwise unimportable — and the runner reads the same Settings as the app
+      # so the two can never target different ClickHouse instances.
+      PYTHONPATH: /srv
+      ENVIRONMENT: local
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_USER: analytics
+      CLICKHOUSE_PASSWORD: dev-only-insecure-clickhouse
+      # Unused here, but Settings validates every field at construction.
       DATABASE_URL: postgresql+asyncpg://shortener:shortener@postgres:5432/shortener
       REDIS_URL: redis://redis:6379/0
       SECRET_KEY: dev-only-insecure-change-me-0000000000000000
@@ -148,6 +179,9 @@ services:
       # Same reasoning as kafka-init: N replicas starting together must not race the
       # same `alembic upgrade`, so it runs once here rather than in api's lifespan.
       migrate: {condition: service_completed_successfully}
+      # The ingest chain must exist before the first click is produced; with no MV
+      # attached the Kafka table does not even poll, so events would sit unread.
+      migrate-clickhouse: {condition: service_completed_successfully}
     environment:
       ENVIRONMENT: local
       PUBLIC_BASE_URL: http://localhost:8000
